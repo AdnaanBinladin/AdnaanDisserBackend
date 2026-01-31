@@ -11,6 +11,7 @@ from src.utils.password_utils import validate_password_strength
 from src.utils.jwt import decode_jwt
 from flask_mail import Message
 from src.utils.mail_instance import mail
+from src.utils.validators import is_valid_email
 
 
 logging.basicConfig(
@@ -41,14 +42,23 @@ def register_user():
         address = data.get("address")
         description = data.get("description")
 
-        # ✅ Validate common fields
+        # 1️⃣ Required fields
         if not all([email, password, full_name, role]):
             return jsonify({"error": "Missing required fields"}), 400
 
-        # ✅ Hash password
+        # 2️⃣ Email format validation 🔥
+        if not is_valid_email(email):
+            return jsonify({"error": "Invalid email format"}), 400
+
+        # 3️⃣ Password strength validation 🔥
+        strength_error = validate_password_strength(password)
+        if strength_error:
+            return jsonify({"error": strength_error}), 400
+
+        # 4️⃣ Hash password
         hashed_pw = generate_password_hash(password)
 
-        # ✅ Step 1: Insert into 'users' table
+        # 5️⃣ Insert user
         user_response = supabase.table("users").insert({
             "email": email,
             "password_hash": hashed_pw,
@@ -63,12 +73,12 @@ def register_user():
 
         user_id = user_response.data[0]["id"]
 
-        # ✅ Step 2: If NGO, create record in 'organizations'
+        # 6️⃣ NGO logic (unchanged)
         if role == "ngo":
             if not all([address, description, phone]):
                 return jsonify({"error": "Missing NGO organization fields"}), 400
 
-            org_response = supabase.table("organizations").insert({
+            supabase.table("organizations").insert({
                 "user_id": user_id,
                 "name": full_name,
                 "address": address,
@@ -77,37 +87,15 @@ def register_user():
                 "verification_status": "pending"
             }).execute()
 
-            if not org_response.data:
-                return jsonify({"error": "Failed to create organization record"}), 500
-
-            # ✅ Optional: Create welcome notification for NGO
-            try:
-                supabase.table("notifications").insert({
-                    "user_id": user_id,
-                    "title": "NGO Registration Pending Review 🕒",
-                    "message": f"Your organization '{full_name}' has been submitted and is awaiting admin approval.",
-                    "type": "status_update",
-                    "read": False,
-                    "created_at": datetime.datetime.utcnow().isoformat()
-                }).execute()
-            except Exception as notif_err:
-                print("⚠️ Failed to create NGO notification:", notif_err)
-
-        # ✅ Return success
         return jsonify({
             "message": "User registered successfully",
             "user_id": user_id
         }), 201
 
     except APIError as e:
-        error_message = str(e).lower()
-        if "duplicate key" in error_message and "email" in error_message:
+        if "duplicate key" in str(e).lower():
             return jsonify({"error": "Email already exists"}), 409
         return jsonify({"error": "Database error occurred"}), 500
-
-    except Exception as e:
-        print("⚠️ Registration Error:", e)
-        return jsonify({"error": str(e)}), 500
 
 
 # ────────────────────────────────────────────────────────────────
@@ -124,22 +112,39 @@ def login_user():
             return jsonify({"error": "Email and password are required"}), 400
 
         # ✅ Query user by email
-        user = supabase.table("users").select("*").eq("email", email).single().execute()
+        user = (
+            supabase
+            .table("users")
+            .select("*")
+            .eq("email", email)
+            .single()
+            .execute()
+        )
 
         if not user.data:
             return jsonify({"error": "Invalid email or password"}), 401
 
-        # ✅ Verify password hash
+        # ✅ Verify password
         if not check_password_hash(user.data["password_hash"], password):
             return jsonify({"error": "Invalid email or password"}), 401
 
+        # 🚫 Block inactive / suspended accounts
+        if user.data.get("status") != "active":
+            return jsonify({
+                "error": "Your account is not active. Please contact support."
+            }), 403
+
         # ✅ Generate JWT token
-        token = jwt.encode({
-            "user_id": user.data["id"],
-            "email": user.data["email"],
-            "role": user.data["role"],
-            "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=12)
-        }, JWT_SECRET, algorithm="HS256")
+        token = jwt.encode(
+            {
+                "user_id": user.data["id"],
+                "email": user.data["email"],
+                "role": user.data["role"],
+                "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=12)
+            },
+            JWT_SECRET,
+            algorithm="HS256"
+        )
 
         return jsonify({
             "message": "Login successful",
@@ -153,8 +158,8 @@ def login_user():
         }), 200
 
     except Exception as e:
-        print("⚠️ Login Error:", e)
-        return jsonify({"error": str(e)}), 500
+        logger.exception("🔥 Login Error")
+        return jsonify({"error": "Login failed"}), 500
 
 
 # ────────────────────────────────────────────────────────────────
@@ -164,7 +169,7 @@ def login_user():
 def get_donor_profile(donor_id):
     try:
         response = supabase.table("users").select(
-            "id, full_name, email, phone, role"
+            "id, full_name, email, phone, role, status"
         ).eq("id", donor_id).single().execute()
 
         if not response.data:
@@ -188,7 +193,7 @@ def get_profile():
             return jsonify({"error": "Missing userId"}), 400
 
         user_res = supabase.table("users") \
-            .select("id, full_name, email, phone, role") \
+            .select("id, full_name, email, phone, role, status") \
             .eq("id", user_id) \
             .execute()
 
@@ -296,6 +301,12 @@ def request_password_change():
     # 4️⃣ Verify current password
     if not check_password_hash(user.data["password_hash"], current_password):
         return jsonify({"error": "Current password is incorrect"}), 400
+    
+    # 🔐 4️⃣.5️⃣ BLOCK same password (UX + security consistency)
+    if check_password_hash(user.data["password_hash"], new_password):
+        return jsonify({
+        "error": "New password must be different from your current password"
+    }), 400
 
     # 5️⃣ Validate new password strength
     strength_error = validate_password_strength(new_password)
@@ -307,11 +318,12 @@ def request_password_change():
     otp_hash = generate_password_hash(otp)
     expires_at = datetime.datetime.utcnow() + datetime.timedelta(minutes=10)
 
-    # 7️⃣ Store OTP
+    # 7️⃣ Store OTP (invalidate previous codes implicitly by only using latest)
     supabase.table("password_change_codes").insert({
         "user_id": user_id,
         "code_hash": otp_hash,
         "expires_at": expires_at.isoformat(),
+        "created_at": datetime.datetime.utcnow().isoformat()
     }).execute()
 
     # 8️⃣ Send email
@@ -332,9 +344,235 @@ If you did not request this change, please ignore this email.
 
 – FoodShare Security Team
 """
-
     mail.send(msg)
 
     return jsonify({
         "message": "Verification code sent to your email"
     }), 200
+
+@profile_bp.route("/profile/password/verify", methods=["PATCH"])
+def verify_password_change():
+    # 1️⃣ Auth
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Missing token"}), 401
+
+    token = auth_header.split(" ")[1]
+    payload = decode_jwt(token)
+
+    if not payload:
+        return jsonify({"error": "Invalid or expired token"}), 401
+
+    user_id = payload["user_id"]
+
+    # 2️⃣ Body
+    data = request.get_json()
+    code = data.get("code")
+    new_password = data.get("new_password")
+
+    if not code or not new_password:
+        return jsonify({"error": "Code and new password are required"}), 400
+
+    # 3️⃣ Fetch latest OTP
+    otp_record = (
+        supabase
+        .table("password_change_codes")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if not otp_record.data:
+        return jsonify({"error": "No verification code found"}), 400
+
+    otp_data = otp_record.data[0]
+
+    # 4️⃣ Expiry check
+    expires_at = datetime.datetime.fromisoformat(otp_data["expires_at"])
+    if datetime.datetime.utcnow() > expires_at:
+        return jsonify({"error": "Verification code has expired"}), 400
+
+    # 5️⃣ Verify OTP
+    if not check_password_hash(otp_data["code_hash"], code):
+        return jsonify({"error": "Invalid verification code"}), 400
+
+    # 6️⃣ Fetch current password hash
+    user = (
+        supabase
+        .table("users")
+        .select("password_hash")
+        .eq("id", user_id)
+        .single()
+        .execute()
+    )
+
+    if not user.data:
+        return jsonify({"error": "User not found"}), 404
+
+    # 🔐 7️⃣ BLOCK reusing old password
+    if check_password_hash(user.data["password_hash"], new_password):
+        return jsonify({
+            "error": "New password must be different from your current password"
+        }), 400
+
+    # 8️⃣ Validate password strength (final authority)
+    strength_error = validate_password_strength(new_password)
+    if strength_error:
+        return jsonify({"error": strength_error}), 400
+
+    # 9️⃣ Update password
+    new_hash = generate_password_hash(new_password)
+    supabase.table("users") \
+        .update({"password_hash": new_hash}) \
+        .eq("id", user_id) \
+        .execute()
+
+    # 🔟 Invalidate OTP (one-time use)
+    supabase.table("password_change_codes") \
+        .delete() \
+        .eq("id", otp_data["id"]) \
+        .execute()
+
+    return jsonify({
+        "message": "Password updated successfully"
+    }), 200
+
+
+
+@profile_bp.route("/profile/password/resend", methods=["PATCH"])
+def resend_password_otp():
+    # 1️⃣ Auth
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Missing token"}), 401
+
+    token = auth_header.split(" ")[1]
+    payload = decode_jwt(token)
+
+    if not payload:
+        return jsonify({"error": "Invalid or expired token"}), 401
+
+    user_id = payload["user_id"]
+
+    # 2️⃣ Fetch user email
+    user = supabase.table("users") \
+        .select("email") \
+        .eq("id", user_id) \
+        .single() \
+        .execute()
+
+    if not user.data:
+        return jsonify({"error": "User not found"}), 404
+
+    # 3️⃣ Fetch latest OTP
+    otp_record = supabase.table("password_change_codes") \
+        .select("*") \
+        .eq("user_id", user_id) \
+        .order("created_at", desc=True) \
+        .limit(1) \
+        .execute()
+
+    if otp_record.data:
+        last_created = datetime.datetime.fromisoformat(
+            otp_record.data[0]["created_at"]
+        )
+        # ⏱️ 30s cooldown
+        if datetime.datetime.utcnow() - last_created < datetime.timedelta(seconds=30):
+            return jsonify({
+                "error": "Please wait before resending the code"
+            }), 429
+
+        # ❌ Invalidate previous OTP
+        supabase.table("password_change_codes") \
+            .delete() \
+            .eq("user_id", user_id) \
+            .execute()
+
+    # 4️⃣ Generate new OTP
+    otp = str(random.randint(100000, 999999))
+    otp_hash = generate_password_hash(otp)
+    expires_at = datetime.datetime.utcnow() + datetime.timedelta(minutes=10)
+
+    supabase.table("password_change_codes").insert({
+        "user_id": user_id,
+        "code_hash": otp_hash,
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.datetime.utcnow().isoformat()
+    }).execute()
+
+    # 5️⃣ Send email
+    msg = Message(
+        subject="FoodShare Password Change Verification Code",
+        recipients=[user.data["email"]],
+    )
+    msg.body = f"""
+Hello,
+
+Your new verification code is: {otp}
+
+This code will expire in 10 minutes.
+
+If you did not request this, please ignore this email.
+
+– FoodShare Security Team
+"""
+    mail.send(msg)
+
+    return jsonify({
+        "message": "Verification code resent"
+    }), 200
+
+
+@auth_bp.route("/account/delete", methods=["DELETE"])
+def delete_account():
+    try:
+        data = request.get_json()
+        user_id = data.get("userId")
+
+        if not user_id:
+            return jsonify({"error": "Missing userId"}), 400
+
+        # 1️⃣ Check user exists
+        user = supabase.table("users") \
+            .select("id") \
+            .eq("id", user_id) \
+            .execute()
+
+        if not user.data:
+            return jsonify({"error": "User not found"}), 404
+
+        # 2️⃣ Anonymise donations (keep history)
+        supabase.table("food_donations") \
+            .update({
+                "donor_id": None
+            }) \
+            .eq("donor_id", user_id) \
+            .execute()
+
+        # 3️⃣ Delete notifications
+        supabase.table("notifications") \
+            .delete() \
+            .eq("user_id", user_id) \
+            .execute()
+
+        # 4️⃣ Delete password reset codes
+        supabase.table("password_change_codes") \
+            .delete() \
+            .eq("user_id", user_id) \
+            .execute()
+
+        # 5️⃣ Delete user account
+        supabase.table("users") \
+            .delete() \
+            .eq("id", user_id) \
+            .execute()
+
+        logger.info(f"✅ Account deleted userId={user_id}")
+
+        return jsonify({"message": "Account deleted successfully"}), 200
+
+    except Exception as e:
+        logger.exception("🔥 Delete account failed")
+        return jsonify({"error": "Failed to delete account"}), 500

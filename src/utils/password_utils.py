@@ -9,4 +9,6 @@ def validate_password_strength(password: str) -> str | None:
         return "Password must contain at least one lowercase letter"
     if not re.search(r"[0-9]", password):
         return "Password must contain at least one number"
+    if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
+        return "Password must contain at least one special character"
     return None

@@ -21,10 +21,35 @@ def add_donation():
         data = request.get_json() or {}
 
         # ✅ Required fields
-        required_fields = ["donor_id", "title", "category", "quantity", "unit", "expiry_date", "pickup_address"]
-        missing = [field for field in required_fields if field not in data or not data[field]]
+        required_fields = [
+            "donor_id",
+            "title",
+            "category",
+            "quantity",
+            "unit",
+            "expiry_date",
+            "pickup_address",
+        ]
+        missing = [f for f in required_fields if f not in data or not data[f]]
         if missing:
             return jsonify({"error": f"Missing required fields: {', '.join(missing)}"}), 400
+
+        # ✅ Validate quantity (must be positive integer)
+        try:
+            quantity = int(data["quantity"])
+            if quantity <= 0:
+                return jsonify({"error": "Quantity must be greater than zero"}), 400
+        except (ValueError, TypeError):
+            return jsonify({"error": "Invalid quantity value"}), 400
+
+        # ✅ Validate expiry date (must be in the future)
+        try:
+            expiry_date = datetime.date.fromisoformat(data["expiry_date"])
+            today = datetime.date.today()
+            if expiry_date <= today:
+                return jsonify({"error": "Expiry date must be a future date"}), 400
+        except (ValueError, TypeError):
+            return jsonify({"error": "Invalid expiry date format (YYYY-MM-DD required)"}), 400
 
         # ✅ Optional coordinates
         pickup_lat = data.get("pickup_lat")
@@ -34,7 +59,11 @@ def add_donation():
             try:
                 pickup_lat = float(pickup_lat)
                 pickup_lng = float(pickup_lng)
-            except ValueError:
+
+                # ✅ Coordinate range validation
+                if not (-90 <= pickup_lat <= 90 and -180 <= pickup_lng <= 180):
+                    return jsonify({"error": "Latitude or longitude out of range"}), 400
+            except (ValueError, TypeError):
                 return jsonify({"error": "Invalid latitude or longitude format"}), 400
 
         # ✅ Step 1: Insert new donation
@@ -43,9 +72,9 @@ def add_donation():
             "title": data["title"],
             "description": data.get("description"),
             "category": data["category"],
-            "quantity": int(data["quantity"]),
+            "quantity": quantity,
             "unit": data["unit"],
-            "expiry_date": data["expiry_date"],
+            "expiry_date": expiry_date.isoformat(),
             "pickup_address": data["pickup_address"],
             "pickup_lat": pickup_lat,
             "pickup_lng": pickup_lng,
@@ -70,7 +99,9 @@ def add_donation():
         qr_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
         # ✅ Step 3: Save QR to database
-        supabase.table("food_donations").update({"qr_code": qr_base64}).eq("id", donation_id).execute()
+        supabase.table("food_donations").update(
+            {"qr_code": qr_base64}
+        ).eq("id", donation_id).execute()
 
         # ✅ Step 4: In-app notification
         supabase.table("notifications").insert({
@@ -84,24 +115,26 @@ def add_donation():
 
         # ✅ Step 5: Email with QR code attachment
         try:
-            donor = supabase.table("users").select("email, full_name").eq("id", data["donor_id"]).single().execute()
+            donor = (
+                supabase.table("users")
+                .select("email, full_name")
+                .eq("id", data["donor_id"])
+                .single()
+                .execute()
+            )
             if donor.data and donor.data.get("email"):
-                donor_email = donor.data["email"]
-                donor_name = donor.data.get("full_name", "Donor")
-
                 msg = Message(
                     subject="🎁 Donation Created - QR Code Ready",
-                    recipients=[donor_email],
+                    recipients=[donor.data["email"]],
                     body=(
-                        f"Hi {donor_name},\n\n"
+                        f"Hi {donor.data.get('full_name', 'Donor')},\n\n"
                         f"Thank you for your donation '{data['title']}'!\n\n"
                         f"Attached is your QR code for NGO pickup verification.\n\n"
                         f"Warm regards,\nFoodShare Team 🌱"
-                    )
+                    ),
                 )
                 msg.attach("pickup_qr.png", "image/png", buf.getvalue())
                 mail.send(msg)
-                print(f"📩 QR email sent to {donor_email}")
         except Exception as email_err:
             print("⚠️ Email sending failed:", email_err)
 
@@ -115,6 +148,79 @@ def add_donation():
         print("⚠️ Add donation error:", e)
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+
+#edit
+@donation_bp.route("/donations/<donation_id>", methods=["PUT"])
+def update_donation(donation_id):
+    try:
+        data = request.get_json() or {}
+
+        allowed_fields = [
+            "title", "description", "category", "quantity", "unit",
+            "expiry_date", "pickup_address", "pickup_lat", "pickup_lng",
+            "pickup_instructions", "urgency"
+        ]
+
+        update_data = {}
+
+        for field in allowed_fields:
+            if field not in data:
+                continue
+
+            value = data[field]
+
+            # 🔢 Quantity validation
+            if field == "quantity":
+                try:
+                    value = int(value)
+                    if value <= 0:
+                        return jsonify({"error": "Quantity must be greater than zero"}), 400
+                except (ValueError, TypeError):
+                    return jsonify({"error": "Invalid quantity"}), 400
+
+            # 📅 Expiry date validation
+            if field == "expiry_date":
+                try:
+                    expiry_date = datetime.date.fromisoformat(value)
+                    if expiry_date <= datetime.date.today():
+                        return jsonify({"error": "Expiry date must be in the future"}), 400
+                    value = expiry_date.isoformat()
+                except Exception:
+                    return jsonify({"error": "Invalid expiry date format"}), 400
+
+            # 🌍 Coordinates validation
+            if field in ["pickup_lat", "pickup_lng"] and value is not None:
+                try:
+                    value = float(value)
+                except (ValueError, TypeError):
+                    return jsonify({"error": f"Invalid {field}"}), 400
+
+            update_data[field] = value
+
+        if not update_data:
+            return jsonify({"error": "No valid fields to update"}), 400
+
+        update_data["updated_at"] = datetime.datetime.utcnow().isoformat()
+
+        result = (
+            supabase.table("food_donations")
+            .update(update_data)
+            .eq("id", donation_id)
+            .execute()
+        )
+
+        if not result.data:
+            return jsonify({"error": "Donation not found"}), 404
+
+        return jsonify({"data": result.data}), 200
+
+    except Exception as e:
+        print("⚠️ Update donation error:", e)
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 
 
 # ─────────────────────────────────────────────
