@@ -2,13 +2,19 @@ from flask import Blueprint, request, jsonify
 from src.services.supabase_service import supabase
 from flask_mail import Message
 from src.utils.mail_instance import mail
-import datetime
 import traceback
 import qrcode
 import io
 import base64
+from datetime import date, datetime, timedelta
+
+
+
+
 
 donation_bp = Blueprint("donation", __name__)
+
+
 
 
 # ─────────────────────────────────────────────
@@ -44,8 +50,9 @@ def add_donation():
 
         # ✅ Validate expiry date (must be in the future)
         try:
-            expiry_date = datetime.date.fromisoformat(data["expiry_date"])
-            today = datetime.date.today()
+            expiry_date = date.fromisoformat(data["expiry_date"])
+
+            today = date.today()
             if expiry_date <= today:
                 return jsonify({"error": "Expiry date must be a future date"}), 400
         except (ValueError, TypeError):
@@ -81,8 +88,8 @@ def add_donation():
             "pickup_instructions": data.get("pickup_instructions"),
             "status": "available",
             "urgency": data.get("urgency") or "medium",
-            "created_at": datetime.datetime.utcnow().isoformat(),
-            "updated_at": datetime.datetime.utcnow().isoformat(),
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
         }
 
         result = supabase.table("food_donations").insert(donation).execute()
@@ -110,7 +117,7 @@ def add_donation():
             "message": f"Your donation '{data['title']}' has been created with a pickup QR code for NGO verification.",
             "type": "status_update",
             "read": False,
-            "created_at": datetime.datetime.utcnow().isoformat()
+            "created_at": datetime.utcnow().isoformat()
         }).execute()
 
         # ✅ Step 5: Email with QR code attachment
@@ -156,10 +163,47 @@ def update_donation(donation_id):
     try:
         data = request.get_json() or {}
 
+        # ─────────────────────────────────────────
+        # 🔒 Fetch existing donation (GUARD)
+        # ─────────────────────────────────────────
+        existing = (
+            supabase.table("food_donations")
+            .select("status, final_state")
+            .eq("id", donation_id)
+            .single()
+            .execute()
+        )
+
+        if not existing.data:
+            return jsonify({"error": "Donation not found"}), 404
+
+        # ❌ Block edits if donation is finalized
+        if existing.data.get("final_state") is not None:
+            return jsonify({
+                "error": "This donation is no longer editable"
+            }), 400
+
+        # ❌ Block edits if already completed
+        if existing.data.get("status") == "completed":
+            return jsonify({
+                "error": "Completed donations cannot be edited"
+            }), 400
+
+        # ─────────────────────────────────────────
+        # ✅ Allowed editable fields
+        # ─────────────────────────────────────────
         allowed_fields = [
-            "title", "description", "category", "quantity", "unit",
-            "expiry_date", "pickup_address", "pickup_lat", "pickup_lng",
-            "pickup_instructions", "urgency"
+            "title",
+            "description",
+            "category",
+            "quantity",
+            "unit",
+            "expiry_date",
+            "pickup_address",
+            "pickup_lat",
+            "pickup_lng",
+            "pickup_instructions",
+            "urgency",
         ]
 
         update_data = {}
@@ -175,34 +219,47 @@ def update_donation(donation_id):
                 try:
                     value = int(value)
                     if value <= 0:
-                        return jsonify({"error": "Quantity must be greater than zero"}), 400
+                        return jsonify({
+                            "error": "Quantity must be greater than zero"
+                        }), 400
                 except (ValueError, TypeError):
                     return jsonify({"error": "Invalid quantity"}), 400
 
             # 📅 Expiry date validation
             if field == "expiry_date":
                 try:
-                    expiry_date = datetime.date.fromisoformat(value)
-                    if expiry_date <= datetime.date.today():
-                        return jsonify({"error": "Expiry date must be in the future"}), 400
+                    expiry_date = date.fromisoformat(value)
+                    if expiry_date <= date.today():
+                        return jsonify({
+                            "error": "Expiry date must be in the future"
+                        }), 400
                     value = expiry_date.isoformat()
                 except Exception:
-                    return jsonify({"error": "Invalid expiry date format"}), 400
+                    return jsonify({
+                        "error": "Invalid expiry date format (YYYY-MM-DD required)"
+                    }), 400
 
             # 🌍 Coordinates validation
             if field in ["pickup_lat", "pickup_lng"] and value is not None:
                 try:
                     value = float(value)
                 except (ValueError, TypeError):
-                    return jsonify({"error": f"Invalid {field}"}), 400
+                    return jsonify({
+                        "error": f"Invalid {field}"
+                    }), 400
 
             update_data[field] = value
 
         if not update_data:
-            return jsonify({"error": "No valid fields to update"}), 400
+            return jsonify({
+                "error": "No valid fields to update"
+            }), 400
 
         update_data["updated_at"] = datetime.datetime.utcnow().isoformat()
 
+        # ─────────────────────────────────────────
+        # ✅ Perform update
+        # ─────────────────────────────────────────
         result = (
             supabase.table("food_donations")
             .update(update_data)
@@ -262,10 +319,15 @@ def list_donations(donor_id):
 @donation_bp.route("/donations/<donation_id>/cancel", methods=["PUT"])
 def cancel_donation(donation_id):
     try:
-        # ✅ Fetch existing donation
+        now = datetime.utcnow().isoformat()
+
+
+        # ─────────────────────────────────────────
+        # 🔍 Fetch existing donation (GUARD)
+        # ─────────────────────────────────────────
         existing = (
             supabase.table("food_donations")
-            .select("*")
+            .select("id, donor_id, title, status, final_state")
             .eq("id", donation_id)
             .single()
             .execute()
@@ -274,29 +336,53 @@ def cancel_donation(donation_id):
         if not existing.data:
             return jsonify({"error": "Donation not found"}), 404
 
-        # 🚫 Prevent cancelling completed donations
-        if existing.data["status"] == "completed":
+        # ❌ Completed donations are immutable
+        if existing.data.get("status") == "completed":
             return jsonify({
                 "error": "Completed donations cannot be cancelled"
             }), 400
 
-        # ✅ Update donation status to "cancelled"
-        supabase.table("food_donations").update({
+        # ❌ Block donor double-cancel only
+        if existing.data.get("final_state") == "cancelled_by_donor":
+            return jsonify({
+                "error": "This donation was already cancelled by the donor"
+            }), 400
+
+        # ─────────────────────────────────────────
+        # 🧹 Cancel any ACTIVE NGO claim (history preserved)
+        # ─────────────────────────────────────────
+        supabase.table("ngo_claims").update({
             "status": "cancelled",
-            "updated_at": datetime.datetime.utcnow().isoformat(),
+            "cancelled_at": now
+        }).eq("donation_id", donation_id).eq("status", "active").execute()
+
+        # ─────────────────────────────────────────
+        # ✅ Apply DONOR cancellation (FINAL)
+        # ─────────────────────────────────────────
+        supabase.table("food_donations").update({
+            "status": "available",                # safe default
+            "final_state": "cancelled_by_donor",  # donor owns this
+            "updated_at": now,
         }).eq("id", donation_id).execute()
 
-        # ✅ Create in-app notification
+        # ─────────────────────────────────────────
+        # 🔔 In-app notification
+        # ─────────────────────────────────────────
         supabase.table("notifications").insert({
             "user_id": existing.data["donor_id"],
             "title": "Donation Cancelled ❌",
-            "message": f"Your donation '{existing.data['title']}' has been cancelled.",
+            "message": (
+                f"Your donation '{existing.data['title']}' has been cancelled "
+                f"and is no longer available for pickup."
+            ),
             "type": "status_update",
             "read": False,
-            "created_at": datetime.datetime.utcnow().isoformat(),
+            "created_at": now,
         }).execute()
 
-        # ✅ Send cancellation email
+        # ─────────────────────────────────────────
+        # 📧 Email notification (best effort)
+        # ─────────────────────────────────────────
         try:
             donor = (
                 supabase.table("users")
@@ -312,12 +398,15 @@ def cancel_donation(donation_id):
                     recipients=[donor.data["email"]],
                     body=(
                         f"Hi {donor.data.get('full_name', 'Donor')},\n\n"
-                        f"Your donation titled '{existing.data['title']}' has been successfully cancelled.\n\n"
-                        f"If this was a mistake, you can post it again anytime from your dashboard.\n\n"
-                        f"Warm regards,\nThe FoodShare Team 🌱"
-                    )
+                        f"Your donation titled '{existing.data['title']}' "
+                        f"has been successfully cancelled.\n\n"
+                        f"It will remain in your history for reference.\n\n"
+                        f"Warm regards,\n"
+                        f"The FoodShare Team 🌱"
+                    ),
                 )
                 mail.send(msg)
+
         except Exception as email_err:
             print("⚠️ Email sending failed (cancel donation):", email_err)
             traceback.print_exc()
@@ -331,7 +420,6 @@ def cancel_donation(donation_id):
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-
 # ─────────────────────────────────────────────
 # ⏰ Automatically mark expired donations
 # PUT /api/donations/auto-expire
@@ -339,23 +427,35 @@ def cancel_donation(donation_id):
 @donation_bp.route("/donations/auto-expire", methods=["PUT"])
 def auto_expire_donations():
     """
-    Marks all donations whose expiry_date <= today and status == 'available'
-    as 'expired'. Also sends notifications and emails.
+    Marks donations as expired when:
+    - expiry_date <= today
+    - final_state IS NULL  (not cancelled by donor, not already expired)
+
+    Important rules:
+    - Donor cancellation is FINAL → never overridden
+    - NGO cancellation does NOT use final_state → donation may still expire
+    - Status and claim fields are NOT modified
     """
     try:
-        today = datetime.datetime.utcnow().date().isoformat()
+        today = date.today().isoformat()
+        now = datetime.utcnow().isoformat()
+
+
+
         print("🕒 Running auto-expire check. Today:", today)
 
-        # ✅ Fetch donations that should expire
+        # ─────────────────────────────────────────
+        # 🔍 Fetch ONLY unfinalized donations past expiry
+        # ─────────────────────────────────────────
         to_expire = (
             supabase.table("food_donations")
-            .select("id, donor_id, title, expiry_date, status")
+            .select("id, donor_id, title, expiry_date, final_state")
             .lte("expiry_date", today)
-            .eq("status", "available")
+            .is_("final_state", None)  # ⛔ excludes donor-cancelled & already expired
             .execute()
         )
 
-        if not to_expire or not to_expire.data:
+        if not to_expire.data:
             print("✅ No donations to expire today.")
             return jsonify({"message": "No donations to expire today"}), 200
 
@@ -366,45 +466,69 @@ def auto_expire_donations():
             donor_id = donation["donor_id"]
             title = donation["title"]
 
-            # ✅ Update donation status
-            supabase.table("food_donations")\
-                .update({"status": "expired", "updated_at": datetime.datetime.utcnow().isoformat()})\
-                .eq("id", donation_id)\
-                .execute()
+            # ─────────────────────────────────────────
+            # ✅ Mark donation as expired (FINAL STATE)
+            # ─────────────────────────────────────────
+            supabase.table("food_donations").update({
+                "final_state": "expired",
+                "updated_at": now,
+            }).eq("id", donation_id).execute()
+
             expired_count += 1
 
-            # ✅ Create in-app notification
+            # ─────────────────────────────────────────
+            # 🔔 In-app notification
+            # ─────────────────────────────────────────
             supabase.table("notifications").insert({
                 "user_id": donor_id,
                 "title": "Donation Expired ⚠️",
-                "message": f"Your donation '{title}' has reached its expiry date and is now marked as expired.",
+                "message": (
+                    f"Your donation '{title}' has reached its expiry date "
+                    f"and is no longer available for pickup."
+                ),
                 "type": "status_update",
                 "read": False,
-                "created_at": datetime.datetime.utcnow().isoformat()
+                "created_at": now,
             }).execute()
 
-            # ✅ Send expiry email (optional)
+            # ─────────────────────────────────────────
+            # 📧 Email notification (best effort)
+            # ─────────────────────────────────────────
             try:
-                donor = supabase.table("users").select("email, full_name").eq("id", donor_id).single().execute()
-                if donor.data and donor.data.get("email"):
-                    donor_email = donor.data["email"]
-                    donor_name = donor.data.get("full_name", "Donor")
+                donor = (
+                    supabase.table("users")
+                    .select("email, full_name")
+                    .eq("id", donor_id)
+                    .single()
+                    .execute()
+                )
 
+                if donor.data and donor.data.get("email"):
                     msg = Message(
                         subject="⚠️ Donation Expired - FoodShare",
-                        recipients=[donor_email],
-                        body=f"Hi {donor_name},\n\n"
-                             f"Your donation titled '{title}' has now expired and is no longer visible to NGOs.\n\n"
-                             f"Thank you again for supporting FoodShare.\n\n"
-                             f"Warm regards,\nThe FoodShare Team 🌱"
+                        recipients=[donor.data["email"]],
+                        body=(
+                            f"Hi {donor.data.get('full_name', 'Donor')},\n\n"
+                            f"Your donation titled '{title}' has expired and "
+                            f"is no longer visible to NGOs.\n\n"
+                            f"It will remain in your dashboard for reference.\n\n"
+                            f"Thank you for supporting FoodShare 🌱\n\n"
+                            f"Warm regards,\n"
+                            f"The FoodShare Team"
+                        ),
                     )
                     mail.send(msg)
-                    print(f"📩 Expiry email sent to {donor_email}")
+
             except Exception as email_err:
-                print(f"⚠️ Email sending failed for donation {donation_id}:", email_err)
+                print(
+                    f"⚠️ Email sending failed for expired donation {donation_id}:",
+                    email_err,
+                )
 
         print(f"✅ {expired_count} donations marked as expired.")
-        return jsonify({"message": f"{expired_count} donations marked as expired"}), 200
+        return jsonify({
+            "message": f"{expired_count} donations marked as expired"
+        }), 200
 
     except Exception as e:
         print("⚠️ Auto-expire error:", e)
@@ -418,22 +542,31 @@ def auto_expire_donations():
 def send_expiry_reminders():
     """
     Sends reminders for donations expiring within 24 hours.
-    - Creates in-app notifications
-    - Sends reminder emails
+
+    IMPORTANT:
+    - This reminder is informational ONLY
+    - It is sent even if the donation is:
+        - cancelled
+        - expired
+        - still available
+    - Does NOT change status or final_state
     """
     try:
-        now = datetime.datetime.utcnow()
-        tomorrow = now + datetime.timedelta(days=1)
+        now = datetime.utcnow()
+        tomorrow = now + timedelta(days=1)
+
         today_str = now.date().isoformat()
         tomorrow_str = tomorrow.date().isoformat()
 
         print(f"🕒 Checking for donations expiring between {today_str} and {tomorrow_str}")
 
-        # ✅ Fetch donations expiring within 24 hours and still available
+        # ─────────────────────────────────────────
+        # 🔍 Fetch ALL donations expiring within 24h
+        # (regardless of status / final_state)
+        # ─────────────────────────────────────────
         expiring = (
             supabase.table("food_donations")
-            .select("id, donor_id, title, expiry_date, status")
-            .eq("status", "available")
+            .select("id, donor_id, title, expiry_date, status, final_state")
             .gte("expiry_date", today_str)
             .lte("expiry_date", tomorrow_str)
             .execute()
@@ -444,47 +577,87 @@ def send_expiry_reminders():
             return jsonify({"message": "No donations expiring soon."}), 200
 
         count = 0
+        created_at = now.isoformat()
+
         for donation in expiring.data:
             donor_id = donation["donor_id"]
             title = donation["title"]
+            status = donation.get("status")
+            final_state = donation.get("final_state")
 
-            # ✅ Add in-app notification
+            # ─────────────────────────────────────────
+            # 🏷️ Context-aware message
+            # ─────────────────────────────────────────
+            if final_state == "expired":
+                message = (
+                    f"Your donation '{title}' has expired. "
+                    f"It remains in your history for reference."
+                )
+            elif final_state == "cancelled_by_donor":
+                message = (
+                    f"Your donation '{title}' was cancelled by you "
+                    f"and is approaching its original expiry date."
+                )
+            elif final_state == "cancelled_by_ngo":
+                message = (
+                    f"Your donation '{title}' was cancelled by an NGO "
+                    f"and is approaching its original expiry date."
+                )
+            else:
+                message = (
+                    f"Your donation '{title}' will expire within 24 hours. "
+                    f"Please ensure pickup or update the expiry date."
+                )
+
+            # ─────────────────────────────────────────
+            # 🔔 In-app notification
+            # ─────────────────────────────────────────
             supabase.table("notifications").insert({
                 "user_id": donor_id,
-                "title": "⏰ Donation Expiring Soon",
-                "message": f"Your donation '{title}' will expire soon. Please ensure pickup or extend its date.",
+                "title": "⏰ Donation Expiry Reminder",
+                "message": message,
                 "type": "reminder",
                 "read": False,
-                "created_at": datetime.datetime.utcnow().isoformat()
+                "created_at": created_at,
             }).execute()
 
-            # ✅ Send email reminder
+            # ─────────────────────────────────────────
+            # 📧 Email reminder (best effort)
+            # ─────────────────────────────────────────
             try:
-                donor = supabase.table("users").select("email, full_name").eq("id", donor_id).single().execute()
-                if donor.data and donor.data.get("email"):
-                    donor_email = donor.data["email"]
-                    donor_name = donor.data.get("full_name", "Donor")
+                donor = (
+                    supabase.table("users")
+                    .select("email, full_name")
+                    .eq("id", donor_id)
+                    .single()
+                    .execute()
+                )
 
+                if donor.data and donor.data.get("email"):
                     msg = Message(
-                        subject="⏰ Donation Expiring Soon - FoodShare",
-                        recipients=[donor_email],
+                        subject="⏰ Donation Expiry Reminder - FoodShare",
+                        recipients=[donor.data["email"]],
                         body=(
-                            f"Hi {donor_name},\n\n"
-                            f"This is a friendly reminder that your donation titled '{title}' will expire within 24 hours.\n\n"
-                            f"If it hasn’t been picked up yet, please coordinate.\n\n"
-                            f"Thank you for helping reduce food waste!\n\n"
-                            f"Warm regards,\nThe FoodShare Team 🌱"
-                        )
+                            f"Hi {donor.data.get('full_name', 'Donor')},\n\n"
+                            f"{message}\n\n"
+                            f"This notification is for your reference only.\n\n"
+                            f"Thank you for supporting FoodShare 🌱\n\n"
+                            f"Warm regards,\n"
+                            f"The FoodShare Team"
+                        ),
                     )
                     mail.send(msg)
-                    print(f"📩 Reminder email sent to {donor_email}")
+                    print(f"📩 Reminder email sent to {donor.data['email']}")
+
             except Exception as email_err:
                 print(f"⚠️ Email sending failed for donation '{title}':", email_err)
 
             count += 1
 
         print(f"✅ {count} reminder notifications sent successfully.")
-        return jsonify({"message": f"{count} reminder notifications sent."}), 200
+        return jsonify({
+            "message": f"{count} reminder notifications sent."
+        }), 200
 
     except Exception as e:
         print("⚠️ Reminder job error:", e)
@@ -500,10 +673,14 @@ def send_expiry_reminders():
 @donation_bp.route("/donations/<donation_id>/pickup-confirm", methods=["GET"])
 def confirm_pickup(donation_id):
     try:
-        # 🔍 Fetch donation first
+        # ─────────────────────────────────────────
+        # 🔍 Fetch donation (STRICT GUARDS)
+        # ─────────────────────────────────────────
         existing = (
             supabase.table("food_donations")
-            .select("status, title")
+            .select(
+                "id, title, status, final_state, donor_id"
+            )
             .eq("id", donation_id)
             .single()
             .execute()
@@ -511,31 +688,112 @@ def confirm_pickup(donation_id):
 
         if not existing.data:
             return (
-                "<h1>❌ Donation not found</h1><p>This QR code may be invalid.</p>",
+                "<h1>❌ Donation Not Found</h1>"
+                "<p>This QR code may be invalid or expired.</p>",
                 404,
                 {"Content-Type": "text/html"},
             )
 
-        # 🚫 Prevent double scan
-        if existing.data["status"] == "completed":
+        donation = existing.data
+        status = donation.get("status")
+        final_state = donation.get("final_state")
+        donation_title = donation.get("title", "Unknown Donation")
+
+        # ─────────────────────────────────────────
+        # ❌ Block finalized donations
+        # ─────────────────────────────────────────
+        if final_state is not None:
             return (
-                "<h1>⚠️ Already Confirmed</h1>"
+                "<h1>❌ Donation No Longer Active</h1>"
+                "<p>This donation has been cancelled or expired.</p>",
+                400,
+                {"Content-Type": "text/html"},
+            )
+
+        # ─────────────────────────────────────────
+        # ⚠️ Prevent double pickup
+        # ─────────────────────────────────────────
+        if status == "completed":
+            return (
+                "<h1>⚠️ Pickup Already Confirmed</h1>"
                 "<p>This donation was already marked as picked up.</p>",
                 200,
                 {"Content-Type": "text/html"},
             )
 
-        # ✅ Mark as completed
+        # ─────────────────────────────────────────
+        # ❌ Only CLAIMED donations can be picked up
+        # ─────────────────────────────────────────
+        if status != "claimed":
+            return (
+                "<h1>❌ Pickup Not Allowed</h1>"
+                "<p>This donation has not been claimed by an NGO.</p>",
+                400,
+                {"Content-Type": "text/html"},
+            )
+
+        now = datetime.utcnow().isoformat()
+
+
+        # ─────────────────────────────────────────
+        # ✅ Mark donation as COMPLETED
+        # ─────────────────────────────────────────
         supabase.table("food_donations").update({
             "status": "completed",
-            "updated_at": datetime.datetime.utcnow().isoformat()
+            "updated_at": now,
         }).eq("id", donation_id).execute()
 
-        donation_title = existing.data.get("title", "Unknown Donation")
+        # ─────────────────────────────────────────
+        # 🔔 Notify donor
+        # ─────────────────────────────────────────
+        supabase.table("notifications").insert({
+            "user_id": donation["donor_id"],
+            "title": "Donation Picked Up ✅",
+            "message": (
+                f"Your donation '{donation_title}' has been successfully "
+                f"picked up by the NGO."
+            ),
+            "type": "status_update",
+            "read": False,
+            "created_at": now,
+        }).execute()
 
+        # ─────────────────────────────────────────
+        # 📧 Email notification (best effort)
+        # ─────────────────────────────────────────
+        try:
+            donor = (
+                supabase.table("users")
+                .select("email, full_name")
+                .eq("id", donation["donor_id"])
+                .single()
+                .execute()
+            )
+
+            if donor.data and donor.data.get("email"):
+                msg = Message(
+                    subject="✅ Donation Pickup Confirmed - FoodShare",
+                    recipients=[donor.data["email"]],
+                    body=(
+                        f"Hi {donor.data.get('full_name', 'Donor')},\n\n"
+                        f"Your donation titled '{donation_title}' has been "
+                        f"successfully picked up by the NGO.\n\n"
+                        f"Thank you for making a difference 🌱\n\n"
+                        f"Warm regards,\n"
+                        f"The FoodShare Team"
+                    ),
+                )
+                mail.send(msg)
+
+        except Exception as email_err:
+            print("⚠️ Email sending failed (pickup confirm):", email_err)
+
+        # ─────────────────────────────────────────
+        # ✅ Success HTML response
+        # ─────────────────────────────────────────
         html = f"""
         <html>
-        <body style='font-family: Arial; text-align:center; margin-top: 100px;'>
+        <body style="font-family: Arial; text-align:center; margin-top: 100px;">
             <h1>✅ Pickup Confirmed!</h1>
             <p>The donation <b>{donation_title}</b> has been successfully marked as picked up.</p>
             <p>Thank you for supporting FoodShare 🌱</p>
@@ -547,8 +805,14 @@ def confirm_pickup(donation_id):
 
     except Exception as e:
         print("⚠️ Pickup confirmation error:", e)
-        return f"<h1>Error</h1><p>{e}</p>", 500, {"Content-Type": "text/html"}
- 
+        traceback.print_exc()
+        return (
+            "<h1>❌ Error</h1>"
+            "<p>Something went wrong while confirming pickup.</p>",
+            500,
+            {"Content-Type": "text/html"},
+        )
+
 
 
 # ─────────────────────────────────────────────
@@ -557,54 +821,77 @@ def confirm_pickup(donation_id):
 # ─────────────────────────────────────────────
 @donation_bp.route("/donations/auto-cancel-claims", methods=["PUT"])
 def auto_cancel_claimed_donations():
+    """
+    Auto-cancel NGO claims that were not picked up within 24 hours.
+    """
     try:
         now = datetime.datetime.utcnow()
-        cutoff = now - datetime.timedelta(minutes=1)
+        cutoff = now - datetime.timedelta(hours=24)
 
-        print("🕒 Running auto-cancel for claimed donations older than 24h")
+        print("🕒 Running auto-cancel for NGO claims older than 24h")
 
-        claimed = (
-            supabase.table("food_donations")
-            .select("id, title, donor_id, claimed_date, status")
-            .eq("status", "claimed")
+        # 🔍 Fetch ACTIVE NGO claims older than 24h
+        claims = (
+            supabase.table("ngo_claims")
+            .select("id, donation_id, claimed_at")
+            .eq("status", "active")
+            .lte("claimed_at", cutoff.isoformat())
             .execute()
         )
 
-        if not claimed.data:
-            return jsonify({"message": "No claimed donations found"}), 200
+        if not claims.data:
+            return jsonify({"message": "No expired NGO claims found"}), 200
 
         cancelled_count = 0
 
-        for d in claimed.data:
-            claimed_date = d.get("claimed_date")
-            if not claimed_date:
-                continue
+        for claim in claims.data:
+            claim_id = claim["id"]
+            donation_id = claim["donation_id"]
 
-            claimed_time = datetime.datetime.fromisoformat(claimed_date)
+            # 🔍 Fetch donor from donation (SOURCE OF TRUTH)
+            donation = (
+                supabase.table("food_donations")
+                .select("donor_id")
+                .eq("id", donation_id)
+                .single()
+                .execute()
+            )
 
-            if claimed_time <= cutoff:
-                # 🔁 Make donation AVAILABLE again
-                supabase.table("food_donations").update({
-                    "status": "available",
-                    "claimed_by": None,
-                    "claimed_date": None,
-                    "updated_at": now.isoformat(),
-                }).eq("id", d["id"]).execute()
+            donor_id = donation.data["donor_id"] if donation.data else None
 
-                # 🔔 Notify donor
+            # 1️⃣ Cancel NGO claim
+            supabase.table("ngo_claims").update({
+                "status": "cancelled",
+                "cancelled_at": now.isoformat(),
+            }).eq("id", claim_id).execute()
+
+            # 2️⃣ Update donation lifecycle
+            supabase.table("food_donations").update({
+                "status": "available",
+                "final_state": "expired",
+                "updated_at": now.isoformat(),
+            }).eq("id", donation_id).execute()
+
+            # 3️⃣ Notify donor (if exists)
+            if donor_id:
                 supabase.table("notifications").insert({
-                    "user_id": d["donor_id"],
-                    "title": "Donation Claim Auto-Cancelled ⏰",
-                    "message": f"The donation '{d['title']}' was not picked up within 24 hours and is available again.",
+                    "user_id": donor_id,
+                    "title": "Donation Claim Expired ⏰",
+                    "message": (
+                        "An NGO claimed your donation but did not pick it up "
+                        "within 24 hours. The donation is now available again."
+                    ),
                     "type": "status_update",
                     "read": False,
                     "created_at": now.isoformat(),
                 }).execute()
 
-                cancelled_count += 1
+            cancelled_count += 1
+
+        print(f"✅ {cancelled_count} NGO claims auto-cancelled after 24h")
 
         return jsonify({
-            "message": f"{cancelled_count} claimed donations auto-cancelled"
+            "message": f"{cancelled_count} NGO claims auto-cancelled after 24h"
         }), 200
 
     except Exception as e:
@@ -627,44 +914,78 @@ def ngo_cancel_claim(donation_id):
         if not ngo_id:
             return jsonify({"error": "NGO ID required"}), 400
 
-        donation = (
-            supabase.table("food_donations")
-            .select("*")
-            .eq("id", donation_id)
-            .single()
+        now = datetime.utcnow().isoformat()
+
+        # ─────────────────────────────────────────
+        # 1️⃣ Fetch CLAIMED NGO claim (NOT active)
+        # ─────────────────────────────────────────
+        claim_res = (
+            supabase.table("ngo_claims")
+            .select("id")
+            .eq("donation_id", donation_id)
+            .eq("ngo_id", ngo_id)
+            .eq("status", "claimed")   # ✅ matches DB constraint
+            .maybe_single()            # ✅ prevents PGRST116 crash
             .execute()
         )
 
-        if not donation.data:
-            return jsonify({"error": "Donation not found"}), 404
+        claim = claim_res.data
 
-        if donation.data["status"] != "claimed":
-            return jsonify({"error": "Only claimed donations can be cancelled"}), 400
+        if not claim:
+            return jsonify({
+                "error": "No claimed donation found to cancel"
+            }), 404
 
-        if donation.data.get("claimed_by") != ngo_id:
-            return jsonify({"error": "Unauthorized"}), 403
+        # ─────────────────────────────────────────
+        # 2️⃣ Cancel NGO claim (history preserved)
+        # ─────────────────────────────────────────
+        supabase.table("ngo_claims").update({
+            "status": "cancelled",
+            "cancelled_at": now,
+            "updated_at": now,
+        }).eq("id", claim["id"]).execute()
 
-        # 🔁 Make donation available again
+        # ─────────────────────────────────────────
+        # 3️⃣ Restore donation availability
+        # ─────────────────────────────────────────
         supabase.table("food_donations").update({
             "status": "available",
-            "claimed_by": None,
-            "claimed_date": None,
-            "updated_at": datetime.datetime.utcnow().isoformat(),
+            "final_state": "cancelled_by_ngo",
+            "updated_at": now,
         }).eq("id", donation_id).execute()
 
-        # 🔔 Notify donor
-        supabase.table("notifications").insert({
-            "user_id": donation.data["donor_id"],
-            "title": "Donation Claim Cancelled ❌",
-            "message": f"The NGO cancelled their claim on '{donation.data['title']}'. The donation is available again.",
-            "type": "status_update",
-            "read": False,
-            "created_at": datetime.datetime.utcnow().isoformat(),
-        }).execute()
+        # ─────────────────────────────────────────
+        # 4️⃣ Fetch donor for notification
+        # ─────────────────────────────────────────
+        donation_res = (
+            supabase.table("food_donations")
+            .select("donor_id, title")
+            .eq("id", donation_id)
+            .maybe_single()
+            .execute()
+        )
 
-        return jsonify({"message": "Claim cancelled successfully"}), 200
+        donation = donation_res.data
+
+        if donation and donation.get("donor_id"):
+            supabase.table("notifications").insert({
+                "user_id": donation["donor_id"],
+                "title": "NGO Cancelled Claim ❌",
+                "message": (
+                    f"An NGO cancelled their claim on your donation "
+                    f"'{donation.get('title', 'your donation')}'. "
+                    f"The donation is now available again."
+                ),
+                "type": "status_update",
+                "read": False,
+                "created_at": now,
+            }).execute()
+
+        return jsonify({
+            "message": "Claim cancelled successfully"
+        }), 200
 
     except Exception as e:
-        print("⚠️ NGO cancel error:", e)
+        print("⚠️ NGO cancel claim error:", e)
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
