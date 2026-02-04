@@ -576,3 +576,39 @@ def delete_account():
     except Exception as e:
         logger.exception("🔥 Delete account failed")
         return jsonify({"error": "Failed to delete account"}), 500
+
+
+@auth_bp.route("/organizations/<org_id>", methods=["PATCH"])
+def update_organization(org_id):
+    import traceback
+    try:
+        data = request.get_json() or {}
+
+        update_payload = {
+            "name": data.get("name"),
+            "description": data.get("description"),
+            "address": data.get("address"),
+            "phone": data.get("phone"),
+        }
+
+        update_payload = {k: v for k, v in update_payload.items() if v is not None}
+
+        print("🛠️ UPDATE PAYLOAD =", update_payload)
+
+        result = (
+            supabase
+            .table("organizations")
+            .update(update_payload)
+            .eq("id", org_id)
+            .execute()
+        )
+
+        if not result.data:
+            return jsonify({"error": "Organization not found"}), 404
+
+        return jsonify({"success": True}), 200
+
+    except Exception:
+        print("❌ UPDATE ORG ERROR")
+        print(traceback.format_exc())
+        return jsonify({"error": "Internal server error"}), 500
