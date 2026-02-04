@@ -59,14 +59,17 @@ def register_user():
         hashed_pw = generate_password_hash(password)
 
         # 5️⃣ Insert user
+        status = "pending" if role == "ngo" else "active"
+
         user_response = supabase.table("users").insert({
             "email": email,
             "password_hash": hashed_pw,
             "full_name": full_name,
             "phone": phone,
             "role": role,
-            "status": "active"
+            "status": status
         }).execute()
+
 
         if not user_response.data:
             return jsonify({"error": "Failed to register user"}), 500
@@ -88,8 +91,10 @@ def register_user():
             }).execute()
 
         return jsonify({
-            "message": "User registered successfully",
-            "user_id": user_id
+            "message": "NGO registered successfully and pending approval",
+            "user_id": user_id,
+            "status": status,     
+            "role": role               
         }), 201
 
     except APIError as e:

@@ -12,6 +12,7 @@ from src.routes.ngodashboard_routes import ngo_dashboard_bp
 from src.routes.auth_routes import profile_bp
 from dotenv import load_dotenv
 import os
+from src.routes.admin_routes import admin_bp
 
 # ==========================================
 # 🔹 Load environment variables
@@ -108,6 +109,8 @@ app.register_blueprint(notifications_bp, url_prefix="/api")
 app.register_blueprint(ai_bp, url_prefix="/api")
 app.register_blueprint(ngo_dashboard_bp, url_prefix="/api")
 app.register_blueprint(profile_bp, url_prefix="/api")
+app.register_blueprint(admin_bp, url_prefix="/api")
+
 
 
 # ==========================================

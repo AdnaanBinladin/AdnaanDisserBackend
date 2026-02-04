@@ -1,34 +1,20 @@
 import os
+import os
 import traceback
 from flask import Blueprint, request, jsonify
 from datetime import datetime, timedelta, date
 from supabase import create_client
-from httpx import Client
-from supabase.lib.client_options import ClientOptions
 
-# =====================================================
-# Blueprint
-# =====================================================
 ngo_dashboard_bp = Blueprint("ngo_dashboard", __name__)
 
-# =====================================================
-# Supabase client
-# =====================================================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-http_client = Client(
-    http2=False,      # ✅ Windows fix
-    timeout=30.0
-)
-
 supabase = create_client(
     SUPABASE_URL,
-    SUPABASE_KEY,
-    options=ClientOptions(
-        httpx_client=http_client
-    )
+    SUPABASE_KEY
 )
+
 # =====================================================
 # Helpers
 # =====================================================
