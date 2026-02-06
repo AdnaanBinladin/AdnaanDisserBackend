@@ -130,6 +130,7 @@ def get_admin_stats():
 # GET /api/admin/ngos/pending
 # ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/ngos/pending", methods=["GET"])
+@require_admin
 def get_pending_ngos():
     """
     Fetch all pending NGO verification requests
@@ -167,7 +168,7 @@ def get_pending_ngos():
         for org in pending_orgs:
             user = users_map.get(org.get("user_id"), {})
             result.append({
-                "id": user.get("id"),
+                "user_id": user.get("id"),
                 "org_id": org.get("id"),
                 "full_name": org.get("name") or user.get("full_name"),
                 "email": user.get("email"),

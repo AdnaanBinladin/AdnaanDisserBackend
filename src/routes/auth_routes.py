@@ -34,6 +34,7 @@ JWT_SECRET = os.getenv("JWT_SECRET")
 def register_user():
     try:
         data = request.get_json()
+
         email = data.get("email")
         password = data.get("password")
         full_name = data.get("full_name")
@@ -46,21 +47,27 @@ def register_user():
         if not all([email, password, full_name, role]):
             return jsonify({"error": "Missing required fields"}), 400
 
-        # 2️⃣ Email format validation 🔥
+        # 2️⃣ Email validation
         if not is_valid_email(email):
             return jsonify({"error": "Invalid email format"}), 400
 
-        # 3️⃣ Password strength validation 🔥
+        # 3️⃣ Password validation
         strength_error = validate_password_strength(password)
         if strength_error:
             return jsonify({"error": strength_error}), 400
 
-        # 4️⃣ Hash password
+        # 4️⃣ NGO-specific validation (MUST be before insert)
+        if role == "ngo":
+            if not all([address, description, phone]):
+                return jsonify({"error": "Missing NGO organization fields"}), 400
+
+        # 5️⃣ Hash password
         hashed_pw = generate_password_hash(password)
 
-        # 5️⃣ Insert user
+        # 6️⃣ Correct status
         status = "pending" if role == "ngo" else "active"
 
+        # 7️⃣ Insert user
         user_response = supabase.table("users").insert({
             "email": email,
             "password_hash": hashed_pw,
@@ -70,17 +77,13 @@ def register_user():
             "status": status
         }).execute()
 
-
         if not user_response.data:
             return jsonify({"error": "Failed to register user"}), 500
 
         user_id = user_response.data[0]["id"]
 
-        # 6️⃣ NGO logic (unchanged)
+        # 8️⃣ Insert organization ONLY for NGO
         if role == "ngo":
-            if not all([address, description, phone]):
-                return jsonify({"error": "Missing NGO organization fields"}), 400
-
             supabase.table("organizations").insert({
                 "user_id": user_id,
                 "name": full_name,
@@ -91,10 +94,10 @@ def register_user():
             }).execute()
 
         return jsonify({
-            "message": "NGO registered successfully and pending approval",
+            "message": "Registration successful",
             "user_id": user_id,
-            "status": status,     
-            "role": role               
+            "role": role,
+            "status": status
         }), 201
 
     except APIError as e:
