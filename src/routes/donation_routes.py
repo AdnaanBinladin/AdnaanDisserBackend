@@ -99,7 +99,7 @@ def add_donation():
         donation_id = result.data[0]["id"]
 
         # ✅ Step 2: Generate QR code
-        pickup_url = f"http://192.168.56.1:5050/api/donations/{donation_id}/pickup-confirm"
+        pickup_url = f"https://73d2-102-115-7-206.ngrok-free.app/api/donations/{donation_id}/pickup-confirm"
         qr_img = qrcode.make(pickup_url)
         buf = io.BytesIO()
         qr_img.save(buf, format="PNG")
@@ -354,7 +354,7 @@ def cancel_donation(donation_id):
         supabase.table("ngo_claims").update({
             "status": "cancelled",
             "cancelled_at": now
-        }).eq("donation_id", donation_id).eq("status", "active").execute()
+        }).eq("donation_id", donation_id).eq("status", "claimed").execute()
 
         # ─────────────────────────────────────────
         # ✅ Apply DONOR cancellation (FINAL)
@@ -452,6 +452,7 @@ def auto_expire_donations():
             .select("id, donor_id, title, expiry_date, final_state")
             .lte("expiry_date", today)
             .is_("final_state", None)  # ⛔ excludes donor-cancelled & already expired
+            .neq("status", "completed")
             .execute()
         )
 
@@ -744,6 +745,16 @@ def confirm_pickup(donation_id):
         }).eq("id", donation_id).execute()
 
         # ─────────────────────────────────────────
+        # ✅ Mark NGO claim as COMPLETED
+        # ─────────────────────────────────────────
+        supabase.table("ngo_claims").update({
+             "status": "completed",
+             "completed_at": now,
+             "updated_at": now,
+       }).eq("donation_id", donation_id).eq("status", "claimed").execute()
+
+
+        # ─────────────────────────────────────────
         # 🔔 Notify donor
         # ─────────────────────────────────────────
         supabase.table("notifications").insert({
@@ -823,18 +834,25 @@ def confirm_pickup(donation_id):
 def auto_cancel_claimed_donations():
     """
     Auto-cancel NGO claims that were not picked up within 24 hours.
+
+    RULES:
+    - NEVER touch completed donations
+    - ONLY cancel active NGO claims
+    - Restore donation availability safely
     """
     try:
-        now = datetime.datetime.utcnow()
-        cutoff = now - datetime.timedelta(hours=24)
+        now = datetime.utcnow()
+        cutoff = now - timedelta(hours=24)
 
         print("🕒 Running auto-cancel for NGO claims older than 24h")
 
+        # ─────────────────────────────────────────
         # 🔍 Fetch ACTIVE NGO claims older than 24h
+        # ─────────────────────────────────────────
         claims = (
             supabase.table("ngo_claims")
             .select("id, donation_id, claimed_at")
-            .eq("status", "active")
+            .eq("status", "claimed")
             .lte("claimed_at", cutoff.isoformat())
             .execute()
         )
@@ -848,31 +866,50 @@ def auto_cancel_claimed_donations():
             claim_id = claim["id"]
             donation_id = claim["donation_id"]
 
-            # 🔍 Fetch donor from donation (SOURCE OF TRUTH)
-            donation = (
+            # ─────────────────────────────────────────
+            # 🔒 Fetch donation with STRICT guards
+            # ─────────────────────────────────────────
+            donation_res = (
                 supabase.table("food_donations")
-                .select("donor_id")
+                .select("status, donor_id, final_state")
                 .eq("id", donation_id)
                 .single()
                 .execute()
             )
 
-            donor_id = donation.data["donor_id"] if donation.data else None
+            if not donation_res.data:
+                continue
 
-            # 1️⃣ Cancel NGO claim
+            donation = donation_res.data
+            status = donation.get("status")
+            donor_id = donation.get("donor_id")
+
+            # ❌ NEVER touch completed donations
+            if status == "completed":
+                print(f"⛔ Skipping completed donation {donation_id}")
+                continue
+
+            # ─────────────────────────────────────────
+            # 1️⃣ Cancel NGO claim (HISTORY PRESERVED)
+            # ─────────────────────────────────────────
             supabase.table("ngo_claims").update({
                 "status": "cancelled",
                 "cancelled_at": now.isoformat(),
+                "updated_at": now.isoformat(),
             }).eq("id", claim_id).execute()
 
-            # 2️⃣ Update donation lifecycle
+            # ─────────────────────────────────────────
+            # 2️⃣ Restore donation lifecycle safely
+            # ─────────────────────────────────────────
             supabase.table("food_donations").update({
                 "status": "available",
-                "final_state": "expired",
+                "final_state": None,        # ⬅️ NOT expired
                 "updated_at": now.isoformat(),
             }).eq("id", donation_id).execute()
 
+            # ─────────────────────────────────────────
             # 3️⃣ Notify donor (if exists)
+            # ─────────────────────────────────────────
             if donor_id:
                 supabase.table("notifications").insert({
                     "user_id": donor_id,
@@ -898,7 +935,6 @@ def auto_cancel_claimed_donations():
         print("⚠️ Auto-cancel error:", e)
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
 
 
 # ─────────────────────────────────────────────

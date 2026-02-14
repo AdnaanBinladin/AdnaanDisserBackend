@@ -124,21 +124,25 @@ def ngo_dashboard():
             donors_map = {
                 d["id"]: d for d in (donors_res.data or [])
             }
-
-        # -------------------------------------------------
+ 
+                # -------------------------------------------------
         # 3️⃣ Fetch NGO claims (SOURCE OF TRUTH)
         # -------------------------------------------------
         claims_res = (
             supabase.table("ngo_claims")
             .select("donation_id, status, claimed_at")
             .eq("ngo_id", ngo_id)
+            .order("claimed_at", desc=True)  # ✅ newest first
             .execute()
         )
 
-        ngo_claims = {
-            c["donation_id"]: c
-            for c in (claims_res.data or [])
-        }
+        ngo_claims = {}
+        for c in (claims_res.data or []):
+            donation_id = c["donation_id"]
+            if donation_id not in ngo_claims:
+                ngo_claims[donation_id] = c
+
+
 
         available = []
         urgent = []
