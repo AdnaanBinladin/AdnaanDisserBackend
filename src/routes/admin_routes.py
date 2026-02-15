@@ -66,6 +66,7 @@ def require_admin(f):
 # GET /api/admin/stats
 # ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/stats", methods=["GET"])
+@require_admin
 def get_admin_stats():
     """
     Fetch platform-wide statistics for admin dashboard
@@ -192,6 +193,7 @@ def get_pending_ngos():
 # PUT /api/admin/ngos/<user_id>/approve
 # ──���─────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/ngos/<user_id>/approve", methods=["PUT"])
+@require_admin
 def approve_ngo(user_id):
     """
     Approve an NGO application and send confirmation email
@@ -218,7 +220,6 @@ def approve_ngo(user_id):
             supabase.table("organizations")
             .update({
                 "verification_status": "approved",
-                "verified_at": now,
             })
             .eq("user_id", user_id)
             .execute()
@@ -240,7 +241,7 @@ def approve_ngo(user_id):
                 "Congratulations! Your organization has been verified. "
                 "You can now claim food donations on the platform."
             ),
-            "type": "verification",
+            "type": "status_update",
             "read": False,
             "created_at": now,
         }).execute()
@@ -290,6 +291,7 @@ The FoodShare Team
 # PUT /api/admin/ngos/<user_id>/reject
 # ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/ngos/<user_id>/reject", methods=["PUT"])
+@require_admin
 def reject_ngo(user_id):
     """
     Reject an NGO application with optional reason
@@ -319,8 +321,6 @@ def reject_ngo(user_id):
             supabase.table("organizations")
             .update({
                 "verification_status": "rejected",
-                "rejection_reason": reason,
-                "rejected_at": now,
             })
             .eq("user_id", user_id)
             .execute()
@@ -339,7 +339,7 @@ def reject_ngo(user_id):
             "user_id": user_id,
             "title": "NGO Application Not Approved",
             "message": f"Unfortunately, your application was not approved. Reason: {reason}",
-            "type": "verification",
+            "type": "status_update",
             "read": False,
             "created_at": now,
         }).execute()
@@ -390,6 +390,7 @@ The FoodShare Team
 # GET /api/admin/users
 # ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/users", methods=["GET"])
+@require_admin
 def get_all_users():
     """
     Fetch all users with filters and pagination
