@@ -501,6 +501,7 @@ def get_all_users():
 # PUT /api/admin/users/<user_id>/status
 # ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/users/<user_id>/status", methods=["PUT"])
+@require_admin
 def update_user_status(user_id):
     """
     Suspend or reactivate a user account
@@ -556,7 +557,7 @@ def update_user_status(user_id):
             "user_id": user_id,
             "title": notification_title,
             "message": notification_message,
-            "type": "account_status",
+            "type": "status_update",
             "read": False,
             "created_at": now,
         }).execute()
