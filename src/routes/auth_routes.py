@@ -4,9 +4,11 @@ from src.services.supabase_service import supabase
 from postgrest.exceptions import APIError
 import jwt
 import os
-import datetime
+from datetime import datetime, timedelta
+import hashlib
 import logging
 import random
+import secrets
 from src.utils.password_utils import validate_password_strength
 from src.utils.jwt import decode_jwt
 from flask_mail import Message
@@ -148,7 +150,7 @@ def login_user():
                 "user_id": user.data["id"],
                 "email": user.data["email"],
                 "role": user.data["role"],
-                "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=12)
+                "exp": datetime.utcnow() + timedelta(hours=12)
             },
             JWT_SECRET,
             algorithm="HS256"
@@ -201,7 +203,7 @@ def get_profile():
             return jsonify({"error": "Missing userId"}), 400
 
         user_res = supabase.table("users") \
-            .select("id, full_name, email, phone, role, status") \
+            .select("id, full_name, email, phone, role, status, created_at") \
             .eq("id", user_id) \
             .execute()
 
@@ -321,17 +323,23 @@ def request_password_change():
     if strength_error:
         return jsonify({"error": strength_error}), 400
 
+    # 🔥 NEW STEP: Invalidate any previous OTPs for this user
+    supabase.table("password_change_codes") \
+        .delete() \
+        .eq("user_id", user_id) \
+        .execute()
+
     # 6️⃣ Generate OTP
     otp = str(random.randint(100000, 999999))
     otp_hash = generate_password_hash(otp)
-    expires_at = datetime.datetime.utcnow() + datetime.timedelta(minutes=10)
+    expires_at = datetime.utcnow() + timedelta(minutes=10)
 
     # 7️⃣ Store OTP (invalidate previous codes implicitly by only using latest)
     supabase.table("password_change_codes").insert({
         "user_id": user_id,
         "code_hash": otp_hash,
         "expires_at": expires_at.isoformat(),
-        "created_at": datetime.datetime.utcnow().isoformat()
+        "created_at": datetime.utcnow().isoformat()
     }).execute()
 
     # 8️⃣ Send email
@@ -398,8 +406,8 @@ def verify_password_change():
     otp_data = otp_record.data[0]
 
     # 4️⃣ Expiry check
-    expires_at = datetime.datetime.fromisoformat(otp_data["expires_at"])
-    if datetime.datetime.utcnow() > expires_at:
+    expires_at = datetime.fromisoformat(otp_data["expires_at"])
+    if datetime.utcnow() > expires_at:
         return jsonify({"error": "Verification code has expired"}), 400
 
     # 5️⃣ Verify OTP
@@ -483,11 +491,11 @@ def resend_password_otp():
         .execute()
 
     if otp_record.data:
-        last_created = datetime.datetime.fromisoformat(
+        last_created = datetime.fromisoformat(
             otp_record.data[0]["created_at"]
         )
         # ⏱️ 30s cooldown
-        if datetime.datetime.utcnow() - last_created < datetime.timedelta(seconds=30):
+        if datetime.utcnow() - last_created < timedelta(seconds=30):
             return jsonify({
                 "error": "Please wait before resending the code"
             }), 429
@@ -501,13 +509,13 @@ def resend_password_otp():
     # 4️⃣ Generate new OTP
     otp = str(random.randint(100000, 999999))
     otp_hash = generate_password_hash(otp)
-    expires_at = datetime.datetime.utcnow() + datetime.timedelta(minutes=10)
+    expires_at = datetime.utcnow() + timedelta(minutes=10)
 
     supabase.table("password_change_codes").insert({
         "user_id": user_id,
         "code_hash": otp_hash,
         "expires_at": expires_at.isoformat(),
-        "created_at": datetime.datetime.utcnow().isoformat()
+        "created_at": datetime.utcnow().isoformat()
     }).execute()
 
     # 5️⃣ Send email
@@ -620,3 +628,142 @@ def update_organization(org_id):
         print("❌ UPDATE ORG ERROR")
         print(traceback.format_exc())
         return jsonify({"error": "Internal server error"}), 500
+
+
+
+@auth_bp.route("/auth/forgot-password", methods=["POST"])
+def forgot_password():
+    try:
+        data = request.get_json(silent=True) or {}
+        email = data.get("email")
+
+        # ✅ Always return generic success (security best practice)
+        if not email:
+            return jsonify({
+                "message": "If the account exists, a reset link will be sent"
+            }), 200
+
+        # 🔍 Find user
+        user_res = (
+            supabase.table("users")
+            .select("id")
+            .eq("email", email)
+            .maybe_single()
+            .execute()
+        )
+
+        if not user_res.data:
+            # ❌ Do NOT reveal user existence
+            return jsonify({
+                "message": "If the account exists, a reset link will be sent"
+            }), 200
+
+        user_id = user_res.data["id"]
+
+        # 🔐 Generate secure reset token
+        raw_token = secrets.token_urlsafe(48)
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+
+        # 🧹 Invalidate previous reset tokens
+        supabase.table("password_resets") \
+            .delete() \
+            .eq("user_id", user_id) \
+            .execute()
+
+        # 💾 Store new reset token
+        supabase.table("password_resets").insert({
+            "user_id": user_id,
+            "token_hash": token_hash,
+            "expires_at": (
+                datetime.utcnow() + timedelta(minutes=30)
+            ).isoformat(),
+            "used": False
+        }).execute()
+
+        # 🔗 Build reset link
+        reset_link = (
+            f"{os.getenv('FRONTEND_URL')}"
+            f"/forgot-password/reset-password?token={raw_token}"
+        )
+
+        # 📧 Send email
+        msg = Message(
+            subject="Reset your FoodShare password",
+            recipients=[email],
+        )
+        msg.body = f"""
+Hello,
+
+You requested to reset your FoodShare password.
+
+Click the link below to reset it:
+{reset_link}
+
+This link will expire in 30 minutes.
+
+If you did not request this, please ignore this email.
+
+– FoodShare Security Team
+"""
+        mail.send(msg)
+
+        return jsonify({
+            "message": "If the account exists, a reset link will be sent"
+        }), 200
+
+    except Exception:
+        logger.exception("🔥 Forgot password failed")
+        # Still return generic success (never expose errors here)
+        return jsonify({
+            "message": "If the account exists, a reset link will be sent"
+        }), 200
+
+
+
+@auth_bp.route("/auth/reset-password", methods=["POST"])
+def reset_password():
+    data = request.get_json()
+    token = data.get("token")
+    new_password = data.get("password")
+
+    if not token or not new_password:
+        return jsonify({"error": "Invalid request"}), 400
+
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+
+    reset_res = (
+        supabase.table("password_resets")
+        .select("id, user_id, expires_at, used")
+        .eq("token_hash", token_hash)
+        .maybe_single()
+        .execute()
+    )
+
+    if not reset_res.data:
+        return jsonify({"error": "Invalid or expired token"}), 400
+
+    reset = reset_res.data
+
+    if reset["used"]:
+        return jsonify({"error": "Token already used"}), 400
+
+    expires_at = datetime.fromisoformat(reset["expires_at"])
+
+    if expires_at < datetime.utcnow().replace(tzinfo=expires_at.tzinfo):
+
+
+        return jsonify({"error": "Token expired"}), 400
+
+    # Update password
+    hashed_pw = generate_password_hash(new_password)
+
+    supabase.table("users").update({
+        "password_hash": hashed_pw
+    }).eq("id", reset["user_id"]).execute()
+
+    # Mark token as used
+    supabase.table("password_resets").update({
+        "used": True
+    }).eq("id", reset["id"]).execute()
+
+    return jsonify({"message": "Password reset successful"}), 200

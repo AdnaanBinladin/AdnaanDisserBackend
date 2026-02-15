@@ -1,6 +1,8 @@
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from flask_mail import Message
+
+from src.routes.ads_routes import ads_bp
 from src.routes.auth_routes import auth_bp
 from src.routes.donation_routes import donation_bp
 from src.routes.notifications_routes import notifications_bp
@@ -11,6 +13,7 @@ from src.routes.ai_routes import ai_bp
 from src.routes.ngodashboard_routes import ngo_dashboard_bp
 from src.routes.auth_routes import profile_bp
 from dotenv import load_dotenv
+from werkzeug.exceptions import HTTPException
 import os
 from src.routes.admin_routes import admin_bp
 
@@ -86,18 +89,26 @@ def add_cors_headers(response):
     return response
 
 # ==========================================
-# 🔹 Global error handler (keeps CORS intact)
+# 🔹 Global error handler (REAL errors only)
 # ==========================================
 @app.errorhandler(Exception)
 def handle_exception(e):
+    # ✅ Let Flask handle normal HTTP errors (404, 405, etc.)
+    if isinstance(e, HTTPException):
+        return e
+
+    # ❌ Only catch REAL server crashes
     origin = request.headers.get("Origin")
     response = jsonify({"error": str(e)})
+
     if origin in ALLOWED_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
+
     response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Requested-With"
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS,PUT,DELETE,PATCH"
     response.status_code = 500
+
     return response
 
 # ==========================================
@@ -110,7 +121,7 @@ app.register_blueprint(ai_bp, url_prefix="/api")
 app.register_blueprint(ngo_dashboard_bp, url_prefix="/api")
 app.register_blueprint(profile_bp, url_prefix="/api")
 app.register_blueprint(admin_bp, url_prefix="/api")
-
+app.register_blueprint(ads_bp, url_prefix="/api")
 
 
 # ==========================================
@@ -133,4 +144,13 @@ def start_scheduler():
 # 🔹 Run server
 # ==========================================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5050, debug=True, use_reloader=False)
+    print("✅ Registered routes:")
+    for rule in app.url_map.iter_rules():
+        print(rule)
+
+    app.run(
+        host="0.0.0.0",
+        port=5050,
+        debug=True,
+        use_reloader=False
+    )
