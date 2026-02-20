@@ -4,6 +4,7 @@ import traceback
 from flask import Blueprint, request, jsonify
 from datetime import datetime, timedelta, date
 from supabase import create_client
+from src.utils.audit_log import log_audit
 
 ngo_dashboard_bp = Blueprint("ngo_dashboard", __name__)
 
@@ -179,10 +180,12 @@ def ngo_dashboard():
                 available.append(donation)
                 continue
 
-            # ⏰ System-expired donation
+            # ⏰ System-expired donation -> NEVER visible in available
             if final_state == "expired":
-                if expiry and expiry >= today:
-                    available.append(donation)
+                continue
+
+            # ❌ Date-expired (even if auto-expire hasn't run yet)
+            if expiry and expiry <= today:
                 continue
 
             # ✅ Normal available donation
@@ -249,8 +252,9 @@ def claim_donation(donation_id):
         final_state = donation.get("final_state")
         expiry = safe_parse_date(donation.get("expiry_date"))
 
-        # ❌ Block finalized donations
-        if final_state is not None:
+        # ❌ Block only truly finalized donations.
+        # "cancelled_by_ngo" is intentionally reclaimable.
+        if final_state in ("cancelled_by_donor", "expired"):
             return jsonify({"error": "Donation is no longer available"}), 409
 
         # ❌ Must be available
@@ -260,8 +264,8 @@ def claim_donation(donation_id):
                 "current_status": status
             }), 409
 
-        # ❌ Expired by date
-        if expiry and expiry < date.today():
+        # ❌ Expired by date (same-day expiry is treated as expired)
+        if expiry and expiry <= date.today():
             return jsonify({"error": "Donation has expired"}), 409
 
         now = datetime.utcnow().isoformat()
@@ -285,11 +289,21 @@ def claim_donation(donation_id):
         # -------------------------------------------------
         supabase.table("food_donations").update({
             "status": "claimed",
+            "final_state": None,
             "updated_at": now,
         }).eq("id", donation_id).execute()
 
         log("DONATION CLAIMED SUCCESS", donation_id)
 
+        log_audit(
+            "donation_claimed",
+            user_id=ngo_id,
+            user_role="ngo",
+            entity_type="donation",
+            entity_id=donation_id,
+            metadata={"status": "claimed"},
+            req=request,
+        )
         return jsonify({
             "message": "Donation claimed successfully",
             "donation_id": donation_id,
@@ -335,6 +349,10 @@ def ngo_dashboard_stats():
         # -------------------------------------------------
         for d in base_available:
             expiry = safe_parse_date(d.get("expiry_date"))
+
+            # Skip date-expired rows (same-day expiry treated as expired)
+            if expiry and expiry <= today:
+                continue
 
             # Normal available
             available.append(d)

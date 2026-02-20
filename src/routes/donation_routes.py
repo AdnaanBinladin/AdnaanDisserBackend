@@ -2,10 +2,12 @@ from flask import Blueprint, request, jsonify
 from src.services.supabase_service import supabase
 from flask_mail import Message
 from src.utils.mail_instance import mail
+from src.utils.audit_log import log_audit
 import traceback
 import qrcode
 import io
 import base64
+import time
 from datetime import date, datetime, timedelta
 
 
@@ -13,6 +15,30 @@ from datetime import date, datetime, timedelta
 
 
 donation_bp = Blueprint("donation", __name__)
+
+
+def _execute_with_retry(factory, retries: int = 2, delay_seconds: float = 0.35):
+    """
+    Small retry wrapper for transient Supabase/httpx transport failures
+    (common on Windows dev with HTTP/2).
+    """
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return factory().execute()
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc)
+            transient = (
+                "WinError 10035" in msg
+                or "httpx.ReadError" in msg
+                or "httpcore.ReadError" in msg
+            )
+            if transient and attempt < retries:
+                time.sleep(delay_seconds)
+                continue
+            raise
+    raise last_exc
 
 
 
@@ -145,6 +171,16 @@ def add_donation():
         except Exception as email_err:
             print("⚠️ Email sending failed:", email_err)
 
+        log_audit(
+            "donation_posted",
+            user_id=data["donor_id"],
+            user_role="donor",
+            entity_type="donation",
+            entity_id=donation_id,
+            metadata={"title": data.get("title"), "category": data.get("category")},
+            req=request,
+        )
+
         return jsonify({
             "message": "Donation added successfully with QR code!",
             "qr_code": qr_base64,
@@ -255,7 +291,7 @@ def update_donation(donation_id):
                 "error": "No valid fields to update"
             }), 400
 
-        update_data["updated_at"] = datetime.datetime.utcnow().isoformat()
+        update_data["updated_at"] = datetime.utcnow().isoformat()
 
         # ─────────────────────────────────────────
         # ✅ Perform update
@@ -270,6 +306,13 @@ def update_donation(donation_id):
         if not result.data:
             return jsonify({"error": "Donation not found"}), 404
 
+        log_audit(
+            "donation_edited",
+            entity_type="donation",
+            entity_id=donation_id,
+            metadata={"updated_fields": list(update_data.keys())},
+            req=request,
+        )
         return jsonify({"data": result.data}), 200
 
     except Exception as e:
@@ -286,13 +329,12 @@ def update_donation(donation_id):
 def list_donations(donor_id):
     try:
         # ✅ make sure qr_code column is fetched
-        response = (
+        response = _execute_with_retry(lambda: (
             supabase.table("food_donations")
             .select("*")  # fetch all columns including qr_code
             .eq("donor_id", donor_id)
             .order("created_at", desc=True)
-            .execute()
-        )
+        ))
 
         data = response.data or []
 
@@ -310,6 +352,13 @@ def list_donations(donor_id):
         import traceback
 
         traceback.print_exc()
+        message = str(e)
+        if (
+            "WinError 10035" in message
+            or "httpx.ReadError" in message
+            or "httpcore.ReadError" in message
+        ):
+            return jsonify({"error": "Temporary database connectivity issue. Please retry."}), 503
         return jsonify({"error": str(e)}), 500
 
 
@@ -411,6 +460,15 @@ def cancel_donation(donation_id):
             print("⚠️ Email sending failed (cancel donation):", email_err)
             traceback.print_exc()
 
+        log_audit(
+            "donation_cancelled",
+            user_id=existing.data.get("donor_id"),
+            user_role="donor",
+            entity_type="donation",
+            entity_id=donation_id,
+            metadata={"title": existing.data.get("title"), "reason": "cancelled_by_donor"},
+            req=request,
+        )
         return jsonify({
             "message": "Donation cancelled successfully"
         }), 200
@@ -527,6 +585,13 @@ def auto_expire_donations():
                 )
 
         print(f"✅ {expired_count} donations marked as expired.")
+        log_audit(
+            "donations_expired_auto",
+            user_role="system",
+            entity_type="donation",
+            metadata={"expired_count": expired_count},
+            req=request,
+        )
         return jsonify({
             "message": f"{expired_count} donations marked as expired"
         }), 200
@@ -656,6 +721,13 @@ def send_expiry_reminders():
             count += 1
 
         print(f"✅ {count} reminder notifications sent successfully.")
+        log_audit(
+            "expiry_reminders_sent",
+            user_role="system",
+            entity_type="donation",
+            metadata={"reminder_count": count},
+            req=request,
+        )
         return jsonify({
             "message": f"{count} reminder notifications sent."
         }), 200
@@ -812,6 +884,13 @@ def confirm_pickup(donation_id):
         </html>
         """
 
+        log_audit(
+            "donation_completed",
+            entity_type="donation",
+            entity_id=donation_id,
+            metadata={"status": "completed_via_qr"},
+            req=request,
+        )
         return html, 200, {"Content-Type": "text/html"}
 
     except Exception as e:
@@ -927,6 +1006,13 @@ def auto_cancel_claimed_donations():
 
         print(f"✅ {cancelled_count} NGO claims auto-cancelled after 24h")
 
+        log_audit(
+            "claims_auto_cancelled",
+            user_role="system",
+            entity_type="claim",
+            metadata={"cancelled_count": cancelled_count},
+            req=request,
+        )
         return jsonify({
             "message": f"{cancelled_count} NGO claims auto-cancelled after 24h"
         }), 200
@@ -1017,6 +1103,15 @@ def ngo_cancel_claim(donation_id):
                 "created_at": now,
             }).execute()
 
+        log_audit(
+            "donation_unclaimed",
+            user_id=ngo_id,
+            user_role="ngo",
+            entity_type="donation",
+            entity_id=donation_id,
+            metadata={"reason": "ngo_cancel_claim"},
+            req=request,
+        )
         return jsonify({
             "message": "Claim cancelled successfully"
         }), 200

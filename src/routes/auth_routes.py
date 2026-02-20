@@ -14,6 +14,7 @@ from src.utils.jwt import decode_jwt
 from flask_mail import Message
 from src.utils.mail_instance import mail
 from src.utils.validators import is_valid_email
+from src.utils.audit_log import log_audit
 
 
 logging.basicConfig(
@@ -28,6 +29,19 @@ auth_bp = Blueprint("auth", __name__)
 profile_bp = Blueprint("profile", __name__)
 
 JWT_SECRET = os.getenv("JWT_SECRET")
+
+
+def _require_auth_payload():
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None, (jsonify({"error": "Missing token"}), 401)
+
+    token = auth_header.split(" ", 1)[1]
+    payload = decode_jwt(token)
+    if not payload:
+        return None, (jsonify({"error": "Invalid or expired token"}), 401)
+
+    return payload, None
 
 # ────────────────────────────────────────────────────────────────
 # 🧩 REGISTER ENDPOINT (Handles both Donor and NGO)
@@ -47,20 +61,48 @@ def register_user():
 
         # 1️⃣ Required fields
         if not all([email, password, full_name, role]):
+            log_audit(
+                "register_failed",
+                user_role=role,
+                entity_type="user",
+                metadata={"email": email, "reason": "missing_required_fields"},
+                req=request,
+            )
             return jsonify({"error": "Missing required fields"}), 400
 
         # 2️⃣ Email validation
         if not is_valid_email(email):
+            log_audit(
+                "register_failed",
+                user_role=role,
+                entity_type="user",
+                metadata={"email": email, "reason": "invalid_email"},
+                req=request,
+            )
             return jsonify({"error": "Invalid email format"}), 400
 
         # 3️⃣ Password validation
         strength_error = validate_password_strength(password)
         if strength_error:
+            log_audit(
+                "register_failed",
+                user_role=role,
+                entity_type="user",
+                metadata={"email": email, "reason": "weak_password"},
+                req=request,
+            )
             return jsonify({"error": strength_error}), 400
 
         # 4️⃣ NGO-specific validation (MUST be before insert)
         if role == "ngo":
             if not all([address, description, phone]):
+                log_audit(
+                    "register_failed",
+                    user_role=role,
+                    entity_type="organization",
+                    metadata={"email": email, "reason": "missing_ngo_fields"},
+                    req=request,
+                )
                 return jsonify({"error": "Missing NGO organization fields"}), 400
 
         # 5️⃣ Hash password
@@ -95,6 +137,15 @@ def register_user():
                 "verification_status": "pending"
             }).execute()
 
+        log_audit(
+            "register_successful",
+            user_id=user_id,
+            user_role=role,
+            entity_type="user",
+            entity_id=user_id,
+            metadata={"email": email, "status": status},
+            req=request,
+        )
         return jsonify({
             "message": "Registration successful",
             "user_id": user_id,
@@ -103,6 +154,13 @@ def register_user():
         }), 201
 
     except APIError as e:
+        log_audit(
+            "register_failed",
+            user_role=(request.get_json(silent=True) or {}).get("role"),
+            entity_type="user",
+            metadata={"reason": "api_error", "error": str(e)},
+            req=request,
+        )
         if "duplicate key" in str(e).lower():
             return jsonify({"error": "Email already exists"}), 409
         return jsonify({"error": "Database error occurred"}), 500
@@ -119,6 +177,12 @@ def login_user():
         password = data.get("password")
 
         if not all([email, password]):
+            log_audit(
+                "login_unsuccessful",
+                entity_type="user",
+                metadata={"email": email, "reason": "missing_credentials"},
+                req=request,
+            )
             return jsonify({"error": "Email and password are required"}), 400
 
         # ✅ Query user by email
@@ -132,14 +196,38 @@ def login_user():
         )
 
         if not user.data:
+            log_audit(
+                "login_unsuccessful",
+                entity_type="user",
+                metadata={"email": email, "reason": "user_not_found"},
+                req=request,
+            )
             return jsonify({"error": "Invalid email or password"}), 401
 
         # ✅ Verify password
         if not check_password_hash(user.data["password_hash"], password):
+            log_audit(
+                "login_unsuccessful",
+                user_id=user.data.get("id"),
+                user_role=user.data.get("role"),
+                entity_type="user",
+                entity_id=user.data.get("id"),
+                metadata={"email": email, "reason": "wrong_password"},
+                req=request,
+            )
             return jsonify({"error": "Invalid email or password"}), 401
 
         # 🚫 Block inactive / suspended accounts
         if user.data.get("status") != "active":
+            log_audit(
+                "login_unsuccessful",
+                user_id=user.data.get("id"),
+                user_role=user.data.get("role"),
+                entity_type="user",
+                entity_id=user.data.get("id"),
+                metadata={"email": email, "reason": "inactive_account"},
+                req=request,
+            )
             return jsonify({
                 "error": "Your account is not active. Please contact support."
             }), 403
@@ -156,6 +244,15 @@ def login_user():
             algorithm="HS256"
         )
 
+        log_audit(
+            "login_successful",
+            user_id=user.data.get("id"),
+            user_role=user.data.get("role"),
+            entity_type="user",
+            entity_id=user.data.get("id"),
+            metadata={"email": user.data.get("email")},
+            req=request,
+        )
         return jsonify({
             "message": "Login successful",
             "token": token,
@@ -168,8 +265,30 @@ def login_user():
         }), 200
 
     except Exception as e:
+        log_audit(
+            "login_unsuccessful",
+            entity_type="user",
+            metadata={"reason": "server_error", "error": str(e)},
+            req=request,
+        )
         logger.exception("🔥 Login Error")
         return jsonify({"error": "Login failed"}), 500
+
+
+@auth_bp.route("/auth/verify", methods=["GET"])
+def verify_auth_token():
+    payload, auth_error = _require_auth_payload()
+    if auth_error:
+        return auth_error
+
+    return jsonify(
+        {
+            "valid": True,
+            "user_id": payload.get("user_id"),
+            "email": payload.get("email"),
+            "role": payload.get("role"),
+        }
+    ), 200
 
 
 # ────────────────────────────────────────────────────────────────
@@ -178,6 +297,12 @@ def login_user():
 @auth_bp.route("/donors/<donor_id>", methods=["GET"])
 def get_donor_profile(donor_id):
     try:
+        payload, auth_error = _require_auth_payload()
+        if auth_error:
+            return auth_error
+        if payload.get("role") != "admin" and payload.get("user_id") != donor_id:
+            return jsonify({"error": "Forbidden"}), 403
+
         response = supabase.table("users").select(
             "id, full_name, email, phone, role, status"
         ).eq("id", donor_id).single().execute()
@@ -195,12 +320,18 @@ def get_donor_profile(donor_id):
 @auth_bp.route("/profile", methods=["GET"])
 def get_profile():
     try:
+        payload, auth_error = _require_auth_payload()
+        if auth_error:
+            return auth_error
+
         user_id = request.args.get("userId")
 
         print("🔍 PROFILE FETCH userId =", user_id)
 
         if not user_id:
             return jsonify({"error": "Missing userId"}), 400
+        if payload.get("role") != "admin" and payload.get("user_id") != user_id:
+            return jsonify({"error": "Forbidden"}), 403
 
         user_res = supabase.table("users") \
             .select("id, full_name, email, phone, role, status, created_at") \
@@ -239,6 +370,10 @@ def get_profile():
 @auth_bp.route("/profile", methods=["PATCH"])
 def update_profile():
     try:
+        payload, auth_error = _require_auth_payload()
+        if auth_error:
+            return auth_error
+
         data = request.get_json()
         logger.info(f"PATCH /profile payload: {data}")
 
@@ -247,6 +382,8 @@ def update_profile():
         if not user_id:
             logger.warning("PATCH /profile missing userId")
             return jsonify({"error": "Missing userId"}), 400
+        if payload.get("role") != "admin" and payload.get("user_id") != user_id:
+            return jsonify({"error": "Forbidden"}), 403
 
         update_fields = {
             k: v for k, v in data.items()
@@ -263,6 +400,15 @@ def update_profile():
             .update(update_fields) \
             .eq("id", user_id) \
             .execute()
+
+        log_audit(
+            "profile_edited",
+            user_id=user_id,
+            entity_type="user",
+            entity_id=user_id,
+            metadata={"updated_fields": list(update_fields.keys())},
+            req=request,
+        )
 
         logger.info(f"Profile updated successfully for userId={user_id}")
         return jsonify({"message": "Profile updated successfully"}), 200
@@ -362,6 +508,15 @@ If you did not request this change, please ignore this email.
 """
     mail.send(msg)
 
+    log_audit(
+        "password_change_requested",
+        user_id=user_id,
+        entity_type="user",
+        entity_id=user_id,
+        metadata={"channel": "email_otp"},
+        req=request,
+    )
+
     return jsonify({
         "message": "Verification code sent to your email"
     }), 200
@@ -451,6 +606,15 @@ def verify_password_change():
         .eq("id", otp_data["id"]) \
         .execute()
 
+    log_audit(
+        "password_changed",
+        user_id=user_id,
+        entity_type="user",
+        entity_id=user_id,
+        metadata={"method": "otp_verify"},
+        req=request,
+    )
+
     return jsonify({
         "message": "Password updated successfully"
     }), 200
@@ -536,6 +700,15 @@ If you did not request this, please ignore this email.
 """
     mail.send(msg)
 
+    log_audit(
+        "password_change_otp_resent",
+        user_id=user_id,
+        entity_type="user",
+        entity_id=user_id,
+        metadata={"channel": "email_otp"},
+        req=request,
+    )
+
     return jsonify({
         "message": "Verification code resent"
     }), 200
@@ -544,11 +717,17 @@ If you did not request this, please ignore this email.
 @auth_bp.route("/account/delete", methods=["DELETE"])
 def delete_account():
     try:
+        payload, auth_error = _require_auth_payload()
+        if auth_error:
+            return auth_error
+
         data = request.get_json()
         user_id = data.get("userId")
 
         if not user_id:
             return jsonify({"error": "Missing userId"}), 400
+        if payload.get("role") != "admin" and payload.get("user_id") != user_id:
+            return jsonify({"error": "Forbidden"}), 403
 
         # 1️⃣ Check user exists
         user = supabase.table("users") \
@@ -585,6 +764,15 @@ def delete_account():
             .eq("id", user_id) \
             .execute()
 
+        log_audit(
+            "account_deleted",
+            user_id=user_id,
+            entity_type="user",
+            entity_id=user_id,
+            metadata={"deleted_by": "self"},
+            req=request,
+        )
+
         logger.info(f"✅ Account deleted userId={user_id}")
 
         return jsonify({"message": "Account deleted successfully"}), 200
@@ -598,6 +786,25 @@ def delete_account():
 def update_organization(org_id):
     import traceback
     try:
+        payload, auth_error = _require_auth_payload()
+        if auth_error:
+            return auth_error
+
+        org_res = (
+            supabase
+            .table("organizations")
+            .select("id, user_id")
+            .eq("id", org_id)
+            .limit(1)
+            .execute()
+        )
+        if not org_res.data:
+            return jsonify({"error": "Organization not found"}), 404
+
+        org = org_res.data[0]
+        if payload.get("role") != "admin" and payload.get("user_id") != org.get("user_id"):
+            return jsonify({"error": "Forbidden"}), 403
+
         data = request.get_json() or {}
 
         update_payload = {
@@ -621,6 +828,14 @@ def update_organization(org_id):
 
         if not result.data:
             return jsonify({"error": "Organization not found"}), 404
+
+        log_audit(
+            "organization_edited",
+            entity_type="organization",
+            entity_id=org_id,
+            metadata={"updated_fields": list(update_payload.keys())},
+            req=request,
+        )
 
         return jsonify({"success": True}), 200
 
@@ -706,7 +921,14 @@ If you did not request this, please ignore this email.
 – FoodShare Security Team
 """
         mail.send(msg)
-
+        log_audit(
+            "forgot_password_requested",
+            user_id=user_id,
+            entity_type="user",
+            entity_id=user_id,
+            metadata={"email": email, "account_exists": True},
+            req=request,
+        )
         return jsonify({
             "message": "If the account exists, a reset link will be sent"
         }), 200
@@ -765,5 +987,14 @@ def reset_password():
     supabase.table("password_resets").update({
         "used": True
     }).eq("id", reset["id"]).execute()
+
+    log_audit(
+        "password_reset_completed",
+        user_id=reset["user_id"],
+        entity_type="user",
+        entity_id=reset["user_id"],
+        metadata={"method": "forgot_password_token"},
+        req=request,
+    )
 
     return jsonify({"message": "Password reset successful"}), 200

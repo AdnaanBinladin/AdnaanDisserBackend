@@ -3,7 +3,7 @@ Admin Routes for FoodShare Platform
 Handles admin-specific operations like NGO verification, user management, and system reports.
 """
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, Response
 from werkzeug.security import generate_password_hash
 from src.services.supabase_service import supabase
 from src.utils.jwt import decode_jwt
@@ -14,6 +14,10 @@ import logging
 from datetime import datetime, timedelta, date
 import csv
 import io
+import time
+import json
+import textwrap
+from src.utils.audit_log import log_audit
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,6 +27,122 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 admin_bp = Blueprint("admin", __name__)
+
+
+def execute_with_retry(factory, retries: int = 2, delay_seconds: float = 0.35):
+    """
+    Execute Supabase query with small retry for transient transport errors
+    like httpx.ReadError / WinError 10035.
+    """
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return factory().execute()
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc)
+            transient = (
+                "WinError 10035" in msg
+                or "httpx.ReadError" in msg
+                or "httpcore.ReadError" in msg
+            )
+            if transient and attempt < retries:
+                time.sleep(delay_seconds)
+                continue
+            raise
+    raise last_exc
+
+
+def _apply_audit_filters(
+    query,
+    action: str | None,
+    user_role: str | None,
+    entity_type: str | None,
+    user_id: str | None,
+    date_from: str | None,
+    date_to: str | None,
+):
+    if action and action != "all":
+        query = query.eq("action", action)
+    if user_role and user_role != "all":
+        query = query.eq("user_role", user_role)
+    if entity_type and entity_type != "all":
+        query = query.eq("entity_type", entity_type)
+    if user_id:
+        query = query.eq("user_id", user_id)
+    if date_from:
+        query = query.gte("created_at", date_from)
+    if date_to:
+        query = query.lte("created_at", date_to)
+    return query
+
+
+def _collect_audit_logs(
+    action: str | None,
+    user_role: str | None,
+    entity_type: str | None,
+    user_id: str | None,
+    date_from: str | None,
+    date_to: str | None,
+    search: str | None,
+):
+    base_query = _apply_audit_filters(
+        supabase.table("audit_logs")
+        .select("*")
+        .order("created_at", desc=True),
+        action,
+        user_role,
+        entity_type,
+        user_id,
+        date_from,
+        date_to,
+    )
+
+    logs_res = execute_with_retry(lambda: base_query)
+    logs = logs_res.data or []
+
+    actor_ids = list({row.get("user_id") for row in logs if row.get("user_id")})
+    users_map = {}
+    if actor_ids:
+        users_res = execute_with_retry(
+            lambda: supabase.table("users")
+            .select("id, full_name, email")
+            .in_("id", actor_ids)
+        )
+        users_map = {u["id"]: u for u in (users_res.data or [])}
+
+    enriched = []
+    for row in logs:
+        actor = users_map.get(row.get("user_id"), {})
+        enriched.append(
+            {
+                **row,
+                "actor_name": actor.get("full_name"),
+                "actor_email": actor.get("email"),
+            }
+        )
+
+    if search:
+        search_text = search.strip().lower()
+        if search_text:
+            def matches(item):
+                haystacks = [
+                    str(item.get("action", "")),
+                    str(item.get("entity_type", "")),
+                    str(item.get("user_role", "")),
+                    str(item.get("ip_address", "")),
+                    str(item.get("actor_name", "")),
+                    str(item.get("actor_email", "")),
+                    str(item.get("user_id", "")),
+                    str(item.get("entity_id", "")),
+                    str(item.get("metadata", "")),
+                ]
+                blob = " ".join(haystacks).lower()
+                return search_text in blob
+
+            enriched = [item for item in enriched if matches(item)]
+
+    return enriched
 
 
 # ────────────────────────────────────────────────────────────────
@@ -73,7 +193,9 @@ def get_admin_stats():
     """
     try:
         # Total users count
-        users_res = supabase.table("users").select("id, role, status").execute()
+        users_res = execute_with_retry(
+            lambda: supabase.table("users").select("id, role, status")
+        )
         users = users_res.data or []
 
         total_users = len(users)
@@ -82,16 +204,17 @@ def get_admin_stats():
         ngos = len([u for u in users if u.get("role") == "ngo"])
 
         # Pending NGOs (users with role=ngo but pending organization verification)
-        pending_orgs_res = (
-            supabase.table("organizations")
+        pending_orgs_res = execute_with_retry(
+            lambda: supabase.table("organizations")
             .select("id")
             .eq("verification_status", "pending")
-            .execute()
         )
         pending_ngos = len(pending_orgs_res.data or [])
 
         # Total donations
-        donations_res = supabase.table("food_donations").select("id, status").execute()
+        donations_res = execute_with_retry(
+            lambda: supabase.table("food_donations").select("id, status")
+        )
         donations = donations_res.data or []
 
         total_donations = len(donations)
@@ -100,7 +223,9 @@ def get_admin_stats():
         completed_donations = len([d for d in donations if d.get("status") == "completed"])
 
         # Claims count
-        claims_res = supabase.table("ngo_claims").select("id, status").execute()
+        claims_res = execute_with_retry(
+            lambda: supabase.table("ngo_claims").select("id, status")
+        )
         claims = claims_res.data or []
 
         total_claims = len(claims)
@@ -275,6 +400,15 @@ The FoodShare Team
         except Exception as email_err:
             logger.error(f"Failed to send approval email: {email_err}")
 
+        log_audit(
+            "ngo_approved",
+            user_id=getattr(request, "admin_id", None),
+            user_role="admin",
+            entity_type="organization",
+            entity_id=user_id,
+            metadata={"target_user_id": user_id},
+            req=request,
+        )
         return jsonify({
             "success": True,
             "message": "NGO approved successfully",
@@ -374,6 +508,15 @@ The FoodShare Team
         except Exception as email_err:
             logger.error(f"Failed to send rejection email: {email_err}")
 
+        log_audit(
+            "ngo_rejected",
+            user_id=getattr(request, "admin_id", None),
+            user_role="admin",
+            entity_type="organization",
+            entity_id=user_id,
+            metadata={"target_user_id": user_id, "reason": reason},
+            req=request,
+        )
         return jsonify({
             "success": True,
             "message": "NGO application rejected",
@@ -418,7 +561,7 @@ def get_all_users():
         query = query.order("created_at", desc=True)
 
         # Execute query
-        users_res = query.execute()
+        users_res = execute_with_retry(lambda: query)
         users = users_res.data or []
 
         # Filter by search term (client-side for now)
@@ -436,11 +579,10 @@ def get_all_users():
         # Donation counts
         donations_map = {}
         if user_ids:
-            donations_res = (
-                supabase.table("food_donations")
+            donations_res = execute_with_retry(
+                lambda: supabase.table("food_donations")
                 .select("donor_id")
                 .in_("donor_id", user_ids)
-                .execute()
             )
             for d in (donations_res.data or []):
                 donor_id = d.get("donor_id")
@@ -451,11 +593,10 @@ def get_all_users():
         claims_map = {}
         ngo_ids = [u["id"] for u in users if u.get("role") == "ngo"]
         if ngo_ids:
-            claims_res = (
-                supabase.table("ngo_claims")
+            claims_res = execute_with_retry(
+                lambda: supabase.table("ngo_claims")
                 .select("ngo_id")
                 .in_("ngo_id", ngo_ids)
-                .execute()
             )
             for c in (claims_res.data or []):
                 ngo_id = c.get("ngo_id")
@@ -493,6 +634,287 @@ def get_all_users():
     except Exception as e:
         logger.exception("Get all users error")
         traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@admin_bp.route("/admin/audit-logs", methods=["GET"])
+@require_admin
+def get_audit_logs():
+    """
+    Fetch audit logs with filters and pagination.
+    """
+    try:
+        action = request.args.get("action", "all")
+        user_role = request.args.get("user_role", "all")
+        entity_type = request.args.get("entity_type", "all")
+        user_id = request.args.get("user_id")
+        date_from = request.args.get("date_from")
+        date_to = request.args.get("date_to")
+        search = (request.args.get("search") or "").strip().lower()
+        page = max(int(request.args.get("page", 1)), 1)
+        limit = min(max(int(request.args.get("limit", 20)), 1), 100)
+
+        enriched = _collect_audit_logs(
+            action=action,
+            user_role=user_role,
+            entity_type=entity_type,
+            user_id=user_id,
+            date_from=date_from,
+            date_to=date_to,
+            search=search,
+        )
+
+        total = len(enriched)
+        start = (page - 1) * limit
+        end = start + limit
+        paginated = enriched[start:end]
+        pages = (total + limit - 1) // limit if total > 0 else 1
+
+        return jsonify(
+            {
+                "logs": paginated,
+                "total": total,
+                "page": page,
+                "limit": limit,
+                "pages": pages,
+            }
+        ), 200
+
+    except Exception as e:
+        logger.exception("Get audit logs error")
+        return jsonify({"error": str(e)}), 500
+
+
+@admin_bp.route("/admin/audit-logs/export", methods=["GET"])
+@require_admin
+def export_audit_logs():
+    """
+    Export filtered audit logs as PDF.
+    """
+    try:
+        export_format = (request.args.get("format") or "pdf").lower()
+        if export_format != "pdf":
+            return jsonify({"error": "Only PDF export is supported"}), 400
+
+        try:
+            from reportlab.lib import colors
+            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+            from reportlab.lib.units import mm
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        except ImportError:
+            return jsonify({
+                "error": "PDF export dependency missing. Install reportlab in backend environment."
+            }), 500
+
+        action = request.args.get("action", "all")
+        user_role = request.args.get("user_role", "all")
+        entity_type = request.args.get("entity_type", "all")
+        user_id = request.args.get("user_id")
+        date_from = request.args.get("date_from")
+        date_to = request.args.get("date_to")
+        search = request.args.get("search")
+
+        logs = _collect_audit_logs(
+            action=action,
+            user_role=user_role,
+            entity_type=entity_type,
+            user_id=user_id,
+            date_from=date_from,
+            date_to=date_to,
+            search=search,
+        )
+
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=landscape(A4),
+            leftMargin=10 * mm,
+            rightMargin=10 * mm,
+            topMargin=10 * mm,
+            bottomMargin=10 * mm,
+        )
+
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            "AuditTitle",
+            parent=styles["Title"],
+            fontName="Helvetica-Bold",
+            fontSize=21,
+            textColor=colors.HexColor("#1F2937"),
+            leading=24,
+            spaceAfter=4,
+        )
+        subtitle_style = ParagraphStyle(
+            "AuditSubtitle",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=10,
+            textColor=colors.HexColor("#6B7280"),
+            leading=13,
+        )
+        filter_style = ParagraphStyle(
+            "AuditFilters",
+            parent=styles["BodyText"],
+            fontName="Helvetica",
+            fontSize=9,
+            textColor=colors.HexColor("#374151"),
+            leading=12,
+        )
+        table_header_style = ParagraphStyle(
+            "AuditTableHeader",
+            parent=styles["BodyText"],
+            fontName="Helvetica-Bold",
+            fontSize=9,
+            textColor=colors.white,
+            leading=11,
+        )
+        table_cell_style = ParagraphStyle(
+            "AuditTableCell",
+            parent=styles["BodyText"],
+            fontName="Helvetica",
+            fontSize=8,
+            textColor=colors.HexColor("#111827"),
+            leading=10,
+        )
+        muted_cell_style = ParagraphStyle(
+            "AuditMutedCell",
+            parent=table_cell_style,
+            textColor=colors.HexColor("#4B5563"),
+        )
+
+        story = []
+        generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        top_bar = Table([[""]], colWidths=[277 * mm], rowHeights=[3 * mm])
+        top_bar.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (0, 0), colors.HexColor("#FF6B35")),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                    ("TOPPADDING", (0, 0), (-1, -1), 0),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ]
+            )
+        )
+        story.append(top_bar)
+        story.append(Spacer(1, 8))
+
+        title = Paragraph("FoodShare Audit Logs", title_style)
+        subtitle = Paragraph(
+            f"Generated: {generated_at} UTC | Total logs: {len(logs)}",
+            subtitle_style,
+        )
+
+        filters = [
+            f"Action: {action or 'all'}",
+            f"Role: {user_role or 'all'}",
+            f"Entity: {entity_type or 'all'}",
+            f"Search: {search or '-'}",
+            f"Date from: {date_from or '-'}",
+            f"Date to: {date_to or '-'}",
+        ]
+        filters_para = Paragraph(" | ".join(filters), filter_style)
+
+        story.extend([title, subtitle, Spacer(1, 5), filters_para, Spacer(1, 10)])
+
+        if not logs:
+            no_data = Table(
+                [[Paragraph("No audit logs found for the selected filters.", styles["Normal"])]],
+                colWidths=[277 * mm],
+                rowHeights=[16 * mm],
+            )
+            no_data.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FFF8F0")),
+                        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#F3D4C5")),
+                        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ]
+                )
+            )
+            story.append(no_data)
+        else:
+            header = ["Date", "Action", "Actor", "Role", "Entity", "IP", "Metadata"]
+            rows = [[Paragraph(cell, table_header_style) for cell in header]]
+
+            for row in logs:
+                actor = row.get("actor_name") or row.get("actor_email") or row.get("user_id") or "-"
+                entity = f"{row.get('entity_type') or '-'} / {row.get('entity_id') or '-'}"
+                metadata = row.get("metadata") or {}
+                if isinstance(metadata, dict) and metadata:
+                    important = list(metadata.items())[:6]
+                    metadata_text = ", ".join([f"{k}: {v}" for k, v in important])
+                    if len(metadata) > 6:
+                        metadata_text += ", ..."
+                else:
+                    metadata_text = str(metadata) if metadata else "-"
+
+                metadata_text = textwrap.shorten(metadata_text, width=170, placeholder="...")
+                created = str(row.get("created_at") or "-").replace("T", " ").replace("+00:00", " UTC")
+
+                rows.append(
+                    [
+                        Paragraph(created, muted_cell_style),
+                        Paragraph(str(row.get("action") or "-"), table_cell_style),
+                        Paragraph(str(actor), table_cell_style),
+                        Paragraph(str(row.get("user_role") or "-"), table_cell_style),
+                        Paragraph(entity, table_cell_style),
+                        Paragraph(str(row.get("ip_address") or "-"), muted_cell_style),
+                        Paragraph(metadata_text, muted_cell_style),
+                    ]
+                )
+
+            col_widths = [35 * mm, 28 * mm, 35 * mm, 18 * mm, 54 * mm, 22 * mm, 85 * mm]
+            table = Table(rows, colWidths=col_widths, repeatRows=1)
+            table.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#FF6B35")),
+                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                        ("FONTSIZE", (0, 0), (-1, 0), 9),
+                        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#E0CFC4")),
+                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#FFFCF7"), colors.HexColor("#FFF5EA")]),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                        ("TOPPADDING", (0, 0), (-1, -1), 4),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                    ]
+                )
+            )
+            story.append(table)
+
+        def _draw_footer(canvas, _doc):
+            canvas.saveState()
+            canvas.setStrokeColor(colors.HexColor("#F3D4C5"))
+            canvas.line(10 * mm, 8 * mm, 287 * mm, 8 * mm)
+            canvas.setFont("Helvetica", 8)
+            canvas.setFillColor(colors.HexColor("#6B7280"))
+            canvas.drawString(10 * mm, 4.5 * mm, "FoodShare Admin Audit Report")
+            canvas.drawRightString(
+                287 * mm,
+                4.5 * mm,
+                f"Page {canvas.getPageNumber()}",
+            )
+            canvas.restoreState()
+
+        doc.build(story, onFirstPage=_draw_footer, onLaterPages=_draw_footer)
+        buffer.seek(0)
+
+        filename = f"audit_logs_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
+        return Response(
+            buffer.getvalue(),
+            mimetype="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+
+    except Exception as e:
+        logger.exception("Export audit logs error")
         return jsonify({"error": str(e)}), 500
 
 
@@ -603,6 +1025,15 @@ The FoodShare Team
         except Exception as email_err:
             logger.error(f"Failed to send status update email: {email_err}")
 
+        log_audit(
+            "user_status_edited",
+            user_id=getattr(request, "admin_id", None),
+            user_role="admin",
+            entity_type="user",
+            entity_id=user_id,
+            metadata={"new_status": new_status},
+            req=request,
+        )
         return jsonify({
             "success": True,
             "message": f"User {new_status} successfully",
@@ -658,6 +1089,15 @@ def delete_user_admin(user_id):
 
         logger.info(f"Admin deleted user: {user_id}")
 
+        log_audit(
+            "user_deleted_by_admin",
+            user_id=getattr(request, "admin_id", None),
+            user_role="admin",
+            entity_type="user",
+            entity_id=user_id,
+            metadata={"target_role": user.get("role"), "target_email": user.get("email")},
+            req=request,
+        )
         return jsonify({
             "success": True,
             "message": "User deleted successfully",
@@ -745,6 +1185,7 @@ def get_all_donations():
 # GET /api/admin/reports/<report_type>
 # ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/reports/<report_type>", methods=["GET"])
+@require_admin
 def generate_report(report_type):
     """
     Generate various admin reports
@@ -865,6 +1306,29 @@ def generate_report(report_type):
                 "data": enriched,
             }), 200
 
+        elif report_type == "claims":
+            claims_res = (
+                supabase.table("ngo_claims")
+                .select("id, donation_id, ngo_id, status, claimed_at, completed_at, cancelled_at, updated_at")
+                .order("claimed_at", desc=True)
+                .execute()
+            )
+
+            claims = claims_res.data or []
+            summary = {
+                "total": len(claims),
+                "claimed": len([c for c in claims if c.get("status") == "claimed"]),
+                "completed": len([c for c in claims if c.get("status") == "completed"]),
+                "cancelled": len([c for c in claims if c.get("status") == "cancelled"]),
+            }
+
+            return jsonify({
+                "report_type": "claims",
+                "generated_at": datetime.utcnow().isoformat(),
+                "summary": summary,
+                "data": claims,
+            }), 200
+
         elif report_type == "impact":
             # Platform impact report
             
@@ -957,6 +1421,7 @@ def generate_report(report_type):
 # GET /api/admin/reports/<report_type>/export
 # ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/reports/<report_type>/export", methods=["GET"])
+@require_admin
 def export_report_csv(report_type):
     """
     Export report data as CSV
@@ -1034,6 +1499,153 @@ def export_report_csv(report_type):
                 headers={"Content-Disposition": f"attachment; filename=donations_report_{date.today()}.csv"}
             )
 
+        elif report_type == "claims":
+            claims_res = (
+                supabase.table("ngo_claims")
+                .select("id, donation_id, ngo_id, status, claimed_at, completed_at, cancelled_at, updated_at")
+                .order("claimed_at", desc=True)
+                .execute()
+            )
+
+            data = claims_res.data or []
+            headers = ["ID", "Donation ID", "NGO ID", "Status", "Claimed At", "Completed At", "Cancelled At", "Updated At"]
+
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(headers)
+
+            for row in data:
+                writer.writerow([
+                    row.get("id"),
+                    row.get("donation_id"),
+                    row.get("ngo_id"),
+                    row.get("status"),
+                    row.get("claimed_at"),
+                    row.get("completed_at"),
+                    row.get("cancelled_at"),
+                    row.get("updated_at"),
+                ])
+
+            output.seek(0)
+
+            return Response(
+                output.getvalue(),
+                mimetype="text/csv",
+                headers={"Content-Disposition": f"attachment; filename=claims_report_{date.today()}.csv"}
+            )
+
+        elif report_type == "ngos":
+            orgs_res = (
+                supabase.table("organizations")
+                .select("id, user_id, name, address, description, phone, verification_status, created_at")
+                .order("created_at", desc=True)
+                .execute()
+            )
+
+            data = orgs_res.data or []
+            headers = ["ID", "User ID", "Name", "Phone", "Address", "Verification Status", "Created At", "Description"]
+
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(headers)
+
+            for row in data:
+                writer.writerow([
+                    row.get("id"),
+                    row.get("user_id"),
+                    row.get("name"),
+                    row.get("phone"),
+                    row.get("address"),
+                    row.get("verification_status"),
+                    row.get("created_at"),
+                    row.get("description"),
+                ])
+
+            output.seek(0)
+
+            return Response(
+                output.getvalue(),
+                mimetype="text/csv",
+                headers={"Content-Disposition": f"attachment; filename=ngos_report_{date.today()}.csv"}
+            )
+
+        elif report_type == "impact":
+            claims_res = (
+                supabase.table("ngo_claims")
+                .select("donation_id, status")
+                .eq("status", "completed")
+                .execute()
+            )
+
+            claims = claims_res.data or []
+            donation_ids = list({c["donation_id"] for c in claims if c.get("donation_id")})
+
+            donations_map = {}
+            if donation_ids:
+                donations_res = (
+                    supabase.table("food_donations")
+                    .select("id, quantity, unit, category")
+                    .in_("id", donation_ids)
+                    .execute()
+                )
+                donations_map = {d["id"]: d for d in (donations_res.data or [])}
+
+            PIECE_TO_KG = {"Fruits": 0.18, "Vegetables": 0.25, "Meat": 0.30, "Dairy": 0.50, "Grains": 0.40, "Prepared Food": 0.40}
+
+            def convert_to_kg(qty, unit, category):
+                try:
+                    qty = float(qty)
+                except Exception:
+                    return 0.0
+                unit = (unit or "").lower()
+                if unit == "kg":
+                    return qty
+                if unit == "pieces":
+                    return qty * PIECE_TO_KG.get(category, 0.25)
+                if unit == "liters":
+                    return qty * 1.0
+                if unit == "boxes":
+                    return qty * 5.0
+                return 0.0
+
+            total_food_kg = 0.0
+            category_breakdown = {}
+            for c in claims:
+                donation = donations_map.get(c.get("donation_id"))
+                if not donation:
+                    continue
+                kg = convert_to_kg(
+                    donation.get("quantity", 0),
+                    donation.get("unit"),
+                    donation.get("category")
+                )
+                total_food_kg += kg
+                cat = donation.get("category", "Other")
+                category_breakdown[cat] = category_breakdown.get(cat, 0) + kg
+
+            co2_avoided = total_food_kg * 2.5
+            water_saved = total_food_kg * 1000
+
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(["Metric", "Value"])
+            writer.writerow(["Total Food Saved (kg)", round(total_food_kg, 2)])
+            writer.writerow(["CO2 Avoided (kg)", round(co2_avoided, 2)])
+            writer.writerow(["Water Saved (liters)", round(water_saved, 2)])
+            writer.writerow(["Completed Donations", len(claims)])
+            writer.writerow([])
+            writer.writerow(["Category", "Food Saved (kg)"])
+            for k, v in category_breakdown.items():
+                writer.writerow([k, round(v, 2)])
+
+            output.seek(0)
+
+            return Response(
+                output.getvalue(),
+                mimetype="text/csv",
+                headers={"Content-Disposition": f"attachment; filename=impact_report_{date.today()}.csv"}
+            )
+
         else:
             return jsonify({"error": f"CSV export not available for: {report_type}"}), 400
 
@@ -1096,6 +1708,14 @@ def send_broadcast_notification():
             batch = notifications[i:i + batch_size]
             supabase.table("notifications").insert(batch).execute()
 
+        log_audit(
+            "broadcast_sent",
+            user_id=getattr(request, "admin_id", None),
+            user_role="admin",
+            entity_type="notification",
+            metadata={"recipients": len(users), "target_role": target_role},
+            req=request,
+        )
         return jsonify({
             "success": True,
             "message": f"Notification sent to {len(users)} users",
