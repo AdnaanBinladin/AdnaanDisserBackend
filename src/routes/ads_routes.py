@@ -4,10 +4,8 @@ from datetime import datetime
 from postgrest.exceptions import APIError
 import logging
 import traceback
-from urllib.parse import urlparse
 from flask_mail import Message
 from src.utils.mail_instance import mail
-from src.utils.audit_log import log_audit
 
 ads_bp = Blueprint("ads", __name__)
 logger = logging.getLogger(__name__)
@@ -46,19 +44,9 @@ def create_ad_inquiry():
         if not result.data:
             return jsonify({"error": "Failed to submit inquiry"}), 500
 
-        created = result.data[0]
-        log_audit(
-            "ads_inquiry_created",
-            user_role="advertiser",
-            entity_type="ads_inquiry",
-            entity_id=created.get("id"),
-            metadata={"company_name": company_name, "contact_email": email},
-            req=request,
-        )
-
         return jsonify({
             "message": "Ad inquiry submitted successfully",
-            "inquiry": created,
+            "inquiry": result.data[0],
         }), 201
 
     except APIError as e:
@@ -86,18 +74,6 @@ def _fetch_inquiries(status_filter: str = "all"):
     if status_filter and status_filter != "all":
         query = query.eq("status", status_filter)
     return query.execute()
-
-
-def _is_valid_http_url(value: str) -> bool:
-    try:
-        parsed = urlparse(value)
-        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
-    except Exception:
-        return False
-
-
-def _parse_date(value: str):
-    return datetime.strptime(value, "%Y-%m-%d").date()
 
 
 @ads_bp.route("/ads/inquiries", methods=["GET"])
@@ -147,41 +123,6 @@ def _set_inquiry_status(inquiry_id: str, new_status: str):
     created_ad = None
     image_url = payload.get("image_url") or inquiry.get("image_url")
     redirect_url = payload.get("redirect_url") or inquiry.get("redirect_url")
-    company_name = payload.get("company_name") or inquiry.get("company_name")
-    start_date = payload.get("start_date")
-    end_date = payload.get("end_date")
-
-    if new_status == "approved":
-        wants_publish = any(
-            payload.get(k)
-            for k in ["company_name", "image_url", "redirect_url", "start_date", "end_date", "placement"]
-        )
-
-        if wants_publish:
-            if not company_name or not str(company_name).strip():
-                return jsonify({"error": "company_name is required when publishing an ad"}), 400
-
-            if not image_url:
-                return jsonify({"error": "image_url is required when publishing an ad"}), 400
-
-            if not redirect_url:
-                return jsonify({"error": "redirect_url is required when publishing an ad"}), 400
-
-            if not _is_valid_http_url(str(redirect_url)):
-                return jsonify({"error": "redirect_url must be a valid http/https URL"}), 400
-
-            parsed_start = None
-            parsed_end = None
-            try:
-                if start_date:
-                    parsed_start = _parse_date(str(start_date))
-                if end_date:
-                    parsed_end = _parse_date(str(end_date))
-            except ValueError:
-                return jsonify({"error": "start_date and end_date must be in YYYY-MM-DD format"}), 400
-
-            if parsed_start and parsed_end and parsed_end < parsed_start:
-                return jsonify({"error": "end_date cannot be before start_date"}), 400
 
     email_sent = False
     email_error = None
@@ -218,32 +159,17 @@ FoodShare Team
         # Only publish ad if required assets are provided
         if image_url and redirect_url:
             ad_payload = {
-                "inquiry_id": inquiry_id,
-                "company_name": company_name,
+                "company_name": inquiry.get("company_name"),
                 "image_url": image_url,
                 "redirect_url": redirect_url,
+                "status": "approved",
                 "is_active": True,
                 "placement": payload.get("placement") or "login_page",
-                "start_date": start_date,
-                "end_date": end_date,
                 "created_at": now_iso,
+                "updated_at": now_iso,
             }
 
-            existing_ad_res = (
-                supabase
-                .table("ads")
-                .select("id")
-                .eq("inquiry_id", inquiry_id)
-                .limit(1)
-                .execute()
-            )
-
-            if existing_ad_res.data:
-                ad_id = existing_ad_res.data[0]["id"]
-                ad_res = supabase.table("ads").update(ad_payload).eq("id", ad_id).execute()
-            else:
-                ad_res = supabase.table("ads").insert(ad_payload).execute()
-
+            ad_res = supabase.table("ads").insert(ad_payload).execute()
             if ad_res.data:
                 created_ad = ad_res.data[0]
 
@@ -292,18 +218,6 @@ FoodShare Team
             email_error = str(email_err)
 
     if not email_sent:
-        log_audit(
-            f"ads_inquiry_{new_status}_partial",
-            user_role="admin",
-            entity_type="ads_inquiry",
-            entity_id=inquiry_id,
-            metadata={
-                "email_sent": False,
-                "email_error": email_error or "Unknown SMTP error",
-                "requires_assets": new_status == "approved" and created_ad is None,
-            },
-            req=request,
-        )
         return jsonify({
             "error": "Inquiry status was updated but email could not be sent",
             "inquiry_id": inquiry_id,
@@ -313,19 +227,6 @@ FoodShare Team
             "requires_assets": new_status == "approved" and created_ad is None,
             "ad": created_ad,
         }), 502
-
-    log_audit(
-        f"ads_inquiry_{new_status}",
-        user_role="admin",
-        entity_type="ads_inquiry",
-        entity_id=inquiry_id,
-        metadata={
-            "requires_assets": new_status == "approved" and created_ad is None,
-            "email_sent": email_sent,
-            "ad_id": (created_ad or {}).get("id") if isinstance(created_ad, dict) else None,
-        },
-        req=request,
-    )
 
     return jsonify({
         "message": f"Inquiry {new_status}",
@@ -383,16 +284,3 @@ def get_active_ads():
     result = query.execute()
 
     return jsonify({"ads": result.data or []}), 200
- 
-
-
-
-
-
-
-
-
-
-
-
- 
