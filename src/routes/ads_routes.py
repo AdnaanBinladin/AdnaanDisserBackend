@@ -61,9 +61,7 @@ def create_ad_inquiry():
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 
-# ---------------------------
 # Admin Inquiry Management
-# ---------------------------
 def _fetch_inquiries(status_filter: str = "all"):
     query = (
         supabase

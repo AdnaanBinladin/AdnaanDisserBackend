@@ -10,7 +10,7 @@ import logging
 import random
 import secrets
 from src.utils.password_utils import validate_password_strength
-from src.utils.jwt import decode_jwt
+from src.utils.jwt import decode_jwt, decode_request_token
 from flask_mail import Message
 from src.utils.mail_instance import mail
 from src.utils.validators import is_valid_email
@@ -32,20 +32,13 @@ JWT_SECRET = os.getenv("JWT_SECRET")
 
 
 def _require_auth_payload():
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return None, (jsonify({"error": "Missing token"}), 401)
-
-    token = auth_header.split(" ", 1)[1]
-    payload = decode_jwt(token)
+    payload = decode_request_token(request)
     if not payload:
-        return None, (jsonify({"error": "Invalid or expired token"}), 401)
+        return None, (jsonify({"error": "Missing token"}), 401)
 
     return payload, None
 
-# ────────────────────────────────────────────────────────────────
-# 🧩 REGISTER ENDPOINT (Handles both Donor and NGO)
-# ────────────────────────────────────────────────────────────────
+# REGISTER ENDPOINT (Handles both Donor and NGO)
 @auth_bp.route("/register", methods=["POST"])
 def register_user():
     try:
@@ -59,7 +52,7 @@ def register_user():
         address = data.get("address")
         description = data.get("description")
 
-        # 1️⃣ Required fields
+        # Required fields
         if not all([email, password, full_name, role]):
             log_audit(
                 "register_failed",
@@ -70,7 +63,7 @@ def register_user():
             )
             return jsonify({"error": "Missing required fields"}), 400
 
-        # 2️⃣ Email validation
+        # Email validation
         if not is_valid_email(email):
             log_audit(
                 "register_failed",
@@ -81,7 +74,7 @@ def register_user():
             )
             return jsonify({"error": "Invalid email format"}), 400
 
-        # 3️⃣ Password validation
+        # Password validation
         strength_error = validate_password_strength(password)
         if strength_error:
             log_audit(
@@ -93,7 +86,7 @@ def register_user():
             )
             return jsonify({"error": strength_error}), 400
 
-        # 4️⃣ NGO-specific validation (MUST be before insert)
+        # NGO-specific validation (MUST be before insert)
         if role == "ngo":
             if not all([address, description, phone]):
                 log_audit(
@@ -105,13 +98,13 @@ def register_user():
                 )
                 return jsonify({"error": "Missing NGO organization fields"}), 400
 
-        # 5️⃣ Hash password
+        # Hash password
         hashed_pw = generate_password_hash(password)
 
-        # 6️⃣ Correct status
+        # Correct status
         status = "pending" if role == "ngo" else "active"
 
-        # 7️⃣ Insert user
+        # Insert user
         user_response = supabase.table("users").insert({
             "email": email,
             "password_hash": hashed_pw,
@@ -126,7 +119,7 @@ def register_user():
 
         user_id = user_response.data[0]["id"]
 
-        # 8️⃣ Insert organization ONLY for NGO
+        # Insert organization ONLY for NGO
         if role == "ngo":
             supabase.table("organizations").insert({
                 "user_id": user_id,
@@ -166,9 +159,7 @@ def register_user():
         return jsonify({"error": "Database error occurred"}), 500
 
 
-# ────────────────────────────────────────────────────────────────
-# 🧠 LOGIN ENDPOINT
-# ────────────────────────────────────────────────────────────────
+# LOGIN ENDPOINT
 @auth_bp.route("/login", methods=["POST"])
 def login_user():
     try:
@@ -185,7 +176,7 @@ def login_user():
             )
             return jsonify({"error": "Email and password are required"}), 400
 
-        # ✅ Query user by email
+        # Query user by email
         user = (
             supabase
             .table("users")
@@ -204,7 +195,7 @@ def login_user():
             )
             return jsonify({"error": "Invalid email or password"}), 401
 
-        # ✅ Verify password
+        # Verify password
         if not check_password_hash(user.data["password_hash"], password):
             log_audit(
                 "login_unsuccessful",
@@ -217,22 +208,30 @@ def login_user():
             )
             return jsonify({"error": "Invalid email or password"}), 401
 
-        # 🚫 Block inactive / suspended accounts
+        # Block inactive / suspended accounts
         if user.data.get("status") != "active":
+            account_status = str(user.data.get("status") or "").lower()
+            if account_status == "suspended":
+                error_message = "Your account has been suspended. Please contact support."
+            elif account_status == "pending":
+                error_message = "Your account is pending approval. Please wait for admin verification."
+            else:
+                error_message = "Your account is not active. Please contact support."
+
             log_audit(
                 "login_unsuccessful",
                 user_id=user.data.get("id"),
                 user_role=user.data.get("role"),
                 entity_type="user",
                 entity_id=user.data.get("id"),
-                metadata={"email": email, "reason": "inactive_account"},
+                metadata={"email": email, "reason": "inactive_account", "status": account_status},
                 req=request,
             )
             return jsonify({
-                "error": "Your account is not active. Please contact support."
+                "error": error_message
             }), 403
 
-        # ✅ Generate JWT token
+        # Generate JWT token
         token = jwt.encode(
             {
                 "user_id": user.data["id"],
@@ -291,9 +290,7 @@ def verify_auth_token():
     ), 200
 
 
-# ────────────────────────────────────────────────────────────────
-# 🧾 GET DONOR PROFILE BY ID
-# ────────────────────────────────────────────────────────────────
+# GET DONOR PROFILE BY ID
 @auth_bp.route("/donors/<donor_id>", methods=["GET"])
 def get_donor_profile(donor_id):
     try:
@@ -326,8 +323,6 @@ def get_profile():
 
         user_id = request.args.get("userId")
 
-        print("🔍 PROFILE FETCH userId =", user_id)
-
         if not user_id:
             return jsonify({"error": "Missing userId"}), 400
         if payload.get("role") != "admin" and payload.get("user_id") != user_id:
@@ -338,12 +333,10 @@ def get_profile():
             .eq("id", user_id) \
             .execute()
 
-        print("🧠 SUPABASE RESPONSE =", user_res.data)
-
         if not user_res.data:
             return jsonify({"error": "User not found"}), 404
 
-        user = user_res.data[0]   # ✅ SAFE
+        user = user_res.data[0] # SAFE
 
         if user["role"] == "ngo":
             org_res = supabase.table("organizations") \
@@ -363,7 +356,6 @@ def get_profile():
         }), 200
 
     except Exception as e:
-        print("🔥 PROFILE ERROR:", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -420,7 +412,7 @@ def update_profile():
 
 @profile_bp.route("/profile/password/request", methods=["PATCH"])
 def request_password_change():
-    # 1️⃣ Auth
+    # Auth
     auth_header = request.headers.get("Authorization")
     if not auth_header:
         return jsonify({"error": "Missing token"}), 401
@@ -433,7 +425,7 @@ def request_password_change():
 
     user_id = payload["user_id"]
 
-    # 2️⃣ Body
+    # Body
     data = request.get_json()
     current_password = data.get("current_password")
     new_password = data.get("new_password")
@@ -441,7 +433,7 @@ def request_password_change():
     if not current_password or not new_password:
         return jsonify({"error": "All fields are required"}), 400
 
-    # 3️⃣ Fetch user
+    # Fetch user
     user = (
         supabase
         .table("users")
@@ -454,33 +446,33 @@ def request_password_change():
     if not user.data:
         return jsonify({"error": "User not found"}), 404
 
-    # 4️⃣ Verify current password
+    # Verify current password
     if not check_password_hash(user.data["password_hash"], current_password):
         return jsonify({"error": "Current password is incorrect"}), 400
     
-    # 🔐 4️⃣.5️⃣ BLOCK same password (UX + security consistency)
+    # .5 BLOCK same password (UX + security consistency)
     if check_password_hash(user.data["password_hash"], new_password):
         return jsonify({
         "error": "New password must be different from your current password"
     }), 400
 
-    # 5️⃣ Validate new password strength
+    # Validate new password strength
     strength_error = validate_password_strength(new_password)
     if strength_error:
         return jsonify({"error": strength_error}), 400
 
-    # 🔥 NEW STEP: Invalidate any previous OTPs for this user
+    # NEW STEP: Invalidate any previous OTPs for this user
     supabase.table("password_change_codes") \
         .delete() \
         .eq("user_id", user_id) \
         .execute()
 
-    # 6️⃣ Generate OTP
+    # Generate OTP
     otp = str(random.randint(100000, 999999))
     otp_hash = generate_password_hash(otp)
     expires_at = datetime.utcnow() + timedelta(minutes=10)
 
-    # 7️⃣ Store OTP (invalidate previous codes implicitly by only using latest)
+    # Store OTP (invalidate previous codes implicitly by only using latest)
     supabase.table("password_change_codes").insert({
         "user_id": user_id,
         "code_hash": otp_hash,
@@ -488,7 +480,7 @@ def request_password_change():
         "created_at": datetime.utcnow().isoformat()
     }).execute()
 
-    # 8️⃣ Send email
+    # Send email
     msg = Message(
         subject="FoodShare Password Change Verification Code",
         recipients=[user.data["email"]],
@@ -523,7 +515,7 @@ If you did not request this change, please ignore this email.
 
 @profile_bp.route("/profile/password/verify", methods=["PATCH"])
 def verify_password_change():
-    # 1️⃣ Auth
+    # Auth
     auth_header = request.headers.get("Authorization")
     if not auth_header:
         return jsonify({"error": "Missing token"}), 401
@@ -536,7 +528,7 @@ def verify_password_change():
 
     user_id = payload["user_id"]
 
-    # 2️⃣ Body
+    # Body
     data = request.get_json()
     code = data.get("code")
     new_password = data.get("new_password")
@@ -544,7 +536,7 @@ def verify_password_change():
     if not code or not new_password:
         return jsonify({"error": "Code and new password are required"}), 400
 
-    # 3️⃣ Fetch latest OTP
+    # Fetch latest OTP
     otp_record = (
         supabase
         .table("password_change_codes")
@@ -560,16 +552,16 @@ def verify_password_change():
 
     otp_data = otp_record.data[0]
 
-    # 4️⃣ Expiry check
+    # Expiry check
     expires_at = datetime.fromisoformat(otp_data["expires_at"])
     if datetime.utcnow() > expires_at:
         return jsonify({"error": "Verification code has expired"}), 400
 
-    # 5️⃣ Verify OTP
+    # Verify OTP
     if not check_password_hash(otp_data["code_hash"], code):
         return jsonify({"error": "Invalid verification code"}), 400
 
-    # 6️⃣ Fetch current password hash
+    # Fetch current password hash
     user = (
         supabase
         .table("users")
@@ -582,25 +574,25 @@ def verify_password_change():
     if not user.data:
         return jsonify({"error": "User not found"}), 404
 
-    # 🔐 7️⃣ BLOCK reusing old password
+    # BLOCK reusing old password
     if check_password_hash(user.data["password_hash"], new_password):
         return jsonify({
             "error": "New password must be different from your current password"
         }), 400
 
-    # 8️⃣ Validate password strength (final authority)
+    # Validate password strength (final authority)
     strength_error = validate_password_strength(new_password)
     if strength_error:
         return jsonify({"error": strength_error}), 400
 
-    # 9️⃣ Update password
+    # Update password
     new_hash = generate_password_hash(new_password)
     supabase.table("users") \
         .update({"password_hash": new_hash}) \
         .eq("id", user_id) \
         .execute()
 
-    # 🔟 Invalidate OTP (one-time use)
+    # Invalidate OTP (one-time use)
     supabase.table("password_change_codes") \
         .delete() \
         .eq("id", otp_data["id"]) \
@@ -623,7 +615,7 @@ def verify_password_change():
 
 @profile_bp.route("/profile/password/resend", methods=["PATCH"])
 def resend_password_otp():
-    # 1️⃣ Auth
+    # Auth
     auth_header = request.headers.get("Authorization")
     if not auth_header:
         return jsonify({"error": "Missing token"}), 401
@@ -636,7 +628,7 @@ def resend_password_otp():
 
     user_id = payload["user_id"]
 
-    # 2️⃣ Fetch user email
+    # Fetch user email
     user = supabase.table("users") \
         .select("email") \
         .eq("id", user_id) \
@@ -646,7 +638,7 @@ def resend_password_otp():
     if not user.data:
         return jsonify({"error": "User not found"}), 404
 
-    # 3️⃣ Fetch latest OTP
+    # Fetch latest OTP
     otp_record = supabase.table("password_change_codes") \
         .select("*") \
         .eq("user_id", user_id) \
@@ -658,19 +650,19 @@ def resend_password_otp():
         last_created = datetime.fromisoformat(
             otp_record.data[0]["created_at"]
         )
-        # ⏱️ 30s cooldown
+        # s cooldown
         if datetime.utcnow() - last_created < timedelta(seconds=30):
             return jsonify({
                 "error": "Please wait before resending the code"
             }), 429
 
-        # ❌ Invalidate previous OTP
+        # Invalidate previous OTP
         supabase.table("password_change_codes") \
             .delete() \
             .eq("user_id", user_id) \
             .execute()
 
-    # 4️⃣ Generate new OTP
+    # Generate new OTP
     otp = str(random.randint(100000, 999999))
     otp_hash = generate_password_hash(otp)
     expires_at = datetime.utcnow() + timedelta(minutes=10)
@@ -682,7 +674,7 @@ def resend_password_otp():
         "created_at": datetime.utcnow().isoformat()
     }).execute()
 
-    # 5️⃣ Send email
+    # Send email
     msg = Message(
         subject="FoodShare Password Change Verification Code",
         recipients=[user.data["email"]],
@@ -729,7 +721,7 @@ def delete_account():
         if payload.get("role") != "admin" and payload.get("user_id") != user_id:
             return jsonify({"error": "Forbidden"}), 403
 
-        # 1️⃣ Check user exists
+        # Check user exists
         user = supabase.table("users") \
             .select("id") \
             .eq("id", user_id) \
@@ -738,7 +730,7 @@ def delete_account():
         if not user.data:
             return jsonify({"error": "User not found"}), 404
 
-        # 2️⃣ Anonymise donations (keep history)
+        # Anonymise donations (keep history)
         supabase.table("food_donations") \
             .update({
                 "donor_id": None
@@ -746,19 +738,19 @@ def delete_account():
             .eq("donor_id", user_id) \
             .execute()
 
-        # 3️⃣ Delete notifications
+        # Delete notifications
         supabase.table("notifications") \
             .delete() \
             .eq("user_id", user_id) \
             .execute()
 
-        # 4️⃣ Delete password reset codes
+        # Delete password reset codes
         supabase.table("password_change_codes") \
             .delete() \
             .eq("user_id", user_id) \
             .execute()
 
-        # 5️⃣ Delete user account
+        # Delete user account
         supabase.table("users") \
             .delete() \
             .eq("id", user_id) \
@@ -816,8 +808,6 @@ def update_organization(org_id):
 
         update_payload = {k: v for k, v in update_payload.items() if v is not None}
 
-        print("🛠️ UPDATE PAYLOAD =", update_payload)
-
         result = (
             supabase
             .table("organizations")
@@ -840,8 +830,6 @@ def update_organization(org_id):
         return jsonify({"success": True}), 200
 
     except Exception:
-        print("❌ UPDATE ORG ERROR")
-        print(traceback.format_exc())
         return jsonify({"error": "Internal server error"}), 500
 
 
@@ -852,13 +840,13 @@ def forgot_password():
         data = request.get_json(silent=True) or {}
         email = data.get("email")
 
-        # ✅ Always return generic success (security best practice)
+        # Always return generic success (security best practice)
         if not email:
             return jsonify({
                 "message": "If the account exists, a reset link will be sent"
             }), 200
 
-        # 🔍 Find user
+        # Find user
         user_res = (
             supabase.table("users")
             .select("id")
@@ -868,24 +856,24 @@ def forgot_password():
         )
 
         if not user_res.data:
-            # ❌ Do NOT reveal user existence
+            # Do NOT reveal user existence
             return jsonify({
                 "message": "If the account exists, a reset link will be sent"
             }), 200
 
         user_id = user_res.data["id"]
 
-        # 🔐 Generate secure reset token
+        # Generate secure reset token
         raw_token = secrets.token_urlsafe(48)
         token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
 
-        # 🧹 Invalidate previous reset tokens
+        # Invalidate previous reset tokens
         supabase.table("password_resets") \
             .delete() \
             .eq("user_id", user_id) \
             .execute()
 
-        # 💾 Store new reset token
+        # Store new reset token
         supabase.table("password_resets").insert({
             "user_id": user_id,
             "token_hash": token_hash,
@@ -895,13 +883,13 @@ def forgot_password():
             "used": False
         }).execute()
 
-        # 🔗 Build reset link
+        # Build reset link
         reset_link = (
             f"{os.getenv('FRONTEND_URL')}"
             f"/forgot-password/reset-password?token={raw_token}"
         )
 
-        # 📧 Send email
+        # Send email
         msg = Message(
             subject="Reset your FoodShare password",
             recipients=[email],
@@ -975,6 +963,10 @@ def reset_password():
 
 
         return jsonify({"error": "Token expired"}), 400
+
+    strength_error = validate_password_strength(new_password)
+    if strength_error:
+        return jsonify({"error": strength_error}), 400
 
     # Update password
     hashed_pw = generate_password_hash(new_password)

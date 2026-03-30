@@ -4,10 +4,8 @@ import traceback
 
 notifications_bp = Blueprint("notifications", __name__)
 
-# ─────────────────────────────────────────────
-# 📬 Get all notifications for a specific user
+# Get all notifications for a specific user
 # GET /api/notifications/<user_id>
-# ─────────────────────────────────────────────
 @notifications_bp.route("/notifications/<user_id>", methods=["GET"])
 def get_notifications(user_id):
     """
@@ -33,10 +31,8 @@ def get_notifications(user_id):
         return jsonify({"error": str(e)}), 500
 
 
-# ─────────────────────────────────────────────
-# 🟢 Mark all notifications as read
+# Mark all notifications as read
 # PUT /api/notifications/read/<user_id>
-# ─────────────────────────────────────────────
 @notifications_bp.route("/notifications/read/<user_id>", methods=["PUT"])
 def mark_all_as_read(user_id):
     """
@@ -62,10 +58,8 @@ def mark_all_as_read(user_id):
         return jsonify({"error": str(e)}), 500
 
 
-# ─────────────────────────────────────────────
-# 🟡 Mark a single notification as read (optional)
+# Mark a single notification as read (optional)
 # PUT /api/notifications/read_one/<notif_id>
-# ─────────────────────────────────────────────
 @notifications_bp.route("/notifications/read_one/<notif_id>", methods=["PUT"])
 def mark_single_as_read(notif_id):
     """

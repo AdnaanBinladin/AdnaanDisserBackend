@@ -6,7 +6,7 @@ from src.routes.ads_routes import ads_bp
 from src.routes.auth_routes import auth_bp
 from src.routes.donation_routes import donation_bp
 from src.routes.notifications_routes import notifications_bp
-from src.utils.mail_instance import mail   # ✅ new: shared Mail instance
+from src.utils.mail_instance import mail
 from apscheduler.schedulers.background import BackgroundScheduler
 from src.routes.donation_routes import send_expiry_reminders
 from src.routes.ai_routes import ai_bp
@@ -17,16 +17,13 @@ from werkzeug.exceptions import HTTPException
 import os
 from src.routes.admin_routes import admin_bp
 
-# ==========================================
-# 🔹 Load environment variables
-# ==========================================
-load_dotenv(dotenv_path=os.path.join(os.getcwd(), ".env"))
+# Load environment variables
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
 
 app = Flask(__name__)
 
-# ==========================================
-# 🔹 Email configuration (from .env)
-# ==========================================
+# Mail settings
 app.config.update(
     MAIL_SERVER=os.getenv("MAIL_SERVER", "smtp.gmail.com"),
     MAIL_PORT=int(os.getenv("MAIL_PORT", 587)),
@@ -36,12 +33,9 @@ app.config.update(
     MAIL_DEFAULT_SENDER=os.getenv("MAIL_DEFAULT_SENDER", os.getenv("MAIL_USERNAME")),
 )
 
-# ✅ Initialize Flask-Mail
 mail.init_app(app)
 
-# ==========================================
-# 🔹 Allowed origins (for CORS)
-# ==========================================
+# Allowed frontend origins
 ALLOWED_ORIGINS = [
     "http://127.0.0.1:3000",
     "http://localhost:3000",
@@ -49,7 +43,6 @@ ALLOWED_ORIGINS = [
     "http://192.168.56.1:3001",
 ]
 
-# ✅ Configure Flask-CORS
 CORS(
     app,
     resources={r"/api/*": {"origins": ALLOWED_ORIGINS}},
@@ -58,9 +51,7 @@ CORS(
     methods=["GET", "POST", "OPTIONS", "PUT", "DELETE", "PATCH"],
 )
 
-# ==========================================
-# 🔹 Preflight handler
-# ==========================================
+# Handle preflight requests
 @app.before_request
 def handle_preflight():
     if request.method == "OPTIONS":
@@ -75,9 +66,7 @@ def handle_preflight():
             return response
     return None
 
-# ==========================================
-# 🔹 Apply CORS headers to ALL responses
-# ==========================================
+# Add CORS headers to responses
 @app.after_request
 def add_cors_headers(response):
     origin = request.headers.get("Origin")
@@ -88,16 +77,12 @@ def add_cors_headers(response):
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS,PUT,DELETE,PATCH"
     return response
 
-# ==========================================
-# 🔹 Global error handler (REAL errors only)
-# ==========================================
+# Basic error handler
 @app.errorhandler(Exception)
 def handle_exception(e):
-    # ✅ Let Flask handle normal HTTP errors (404, 405, etc.)
     if isinstance(e, HTTPException):
         return e
 
-    # ❌ Only catch REAL server crashes
     origin = request.headers.get("Origin")
     response = jsonify({"error": str(e)})
 
@@ -111,9 +96,7 @@ def handle_exception(e):
 
     return response
 
-# ==========================================
-# 🔹 Register blueprints
-# ==========================================
+# Routes
 app.register_blueprint(auth_bp, url_prefix="/api")
 app.register_blueprint(donation_bp, url_prefix="/api")
 app.register_blueprint(notifications_bp, url_prefix="/api")
@@ -124,27 +107,20 @@ app.register_blueprint(admin_bp, url_prefix="/api")
 app.register_blueprint(ads_bp, url_prefix="/api")
 
 
-# ==========================================
-# 🔹 Home route
-# ==========================================
 @app.route("/")
 def home():
-    return jsonify({"message": "🥦 FoodShare backend is running with full CORS + email support!"})
+    return jsonify({"message": "FoodShare backend is running."})
 
-# ==========================================
-# 🔹 Scheduler (runs after app + mail are initialized)
-# ==========================================
+# Reminder job
 def start_scheduler():
     scheduler = BackgroundScheduler()
     scheduler.add_job(send_expiry_reminders, "interval", hours=24)
     scheduler.start()
-    print("🕒 Reminder scheduler started (every 24h).")
+    print("Reminder scheduler started.")
 
-# ==========================================
-# 🔹 Run server
-# ==========================================
+
 if __name__ == "__main__":
-    print("✅ Registered routes:")
+    print("Registered routes:")
     for rule in app.url_map.iter_rules():
         print(rule)
 

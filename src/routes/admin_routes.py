@@ -6,7 +6,7 @@ Handles admin-specific operations like NGO verification, user management, and sy
 from flask import Blueprint, request, jsonify, Response
 from werkzeug.security import generate_password_hash
 from src.services.supabase_service import supabase
-from src.utils.jwt import decode_jwt
+from src.utils.jwt import decode_request_token
 from flask_mail import Message
 from src.utils.mail_instance import mail
 import traceback
@@ -145,9 +145,159 @@ def _collect_audit_logs(
     return enriched
 
 
-# ────────────────────────────────────────────────────────────────
-# 🔐 ADMIN AUTH MIDDLEWARE
-# ────────────────────────────────────────────────────────────────
+def _safe_iso_to_datetime(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _normalize_utc_naive(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value.replace(tzinfo=None) if value.tzinfo else value
+
+
+def _activity_level_from(last_activity: datetime | None, total_actions: int) -> str:
+    if total_actions <= 0 or last_activity is None:
+        return "Inactive"
+
+    days_since = (datetime.utcnow() - _normalize_utc_naive(last_activity)).days
+    if days_since <= 7:
+        return "Highly Active"
+    if days_since <= 30:
+        return "Active"
+    return "Inactive"
+
+
+def _build_user_activity_report():
+    users_res = execute_with_retry(
+        lambda: supabase.table("users")
+        .select("id, full_name, email, role, status, created_at")
+        .order("created_at", desc=True)
+    )
+    users = users_res.data or []
+
+    audit_res = execute_with_retry(
+        lambda: supabase.table("audit_logs")
+        .select("user_id, action, created_at")
+        .order("created_at", desc=True)
+    )
+    audit_logs = audit_res.data or []
+
+    activity_map = {}
+    for log in audit_logs:
+        user_id = log.get("user_id")
+        if not user_id:
+            continue
+
+        metrics = activity_map.setdefault(
+            user_id,
+            {
+                "total_logins": 0,
+                "total_actions": 0,
+                "last_login": None,
+                "last_activity": None,
+                "last_action": None,
+            },
+        )
+
+        action = str(log.get("action") or "")
+        created_at = _safe_iso_to_datetime(log.get("created_at"))
+
+        if action == "login_successful":
+            metrics["total_logins"] += 1
+            if created_at and (metrics["last_login"] is None or created_at > metrics["last_login"]):
+                metrics["last_login"] = created_at
+
+        if action and action != "login_unsuccessful":
+            metrics["total_actions"] += 1
+            if created_at and (metrics["last_activity"] is None or created_at > metrics["last_activity"]):
+                metrics["last_activity"] = created_at
+                metrics["last_action"] = action
+
+    report_rows = []
+    for user in users:
+        metrics = activity_map.get(user.get("id"), {})
+        last_login = metrics.get("last_login")
+        last_activity = metrics.get("last_activity")
+        total_actions = int(metrics.get("total_actions") or 0)
+
+        report_rows.append(
+            {
+                "id": user.get("id"),
+                "full_name": user.get("full_name"),
+                "email": user.get("email"),
+                "role": user.get("role"),
+                "account_status": user.get("status"),
+                "last_login": last_login.isoformat() if last_login else "",
+                "total_logins": int(metrics.get("total_logins") or 0),
+                "total_actions": total_actions,
+                "last_action": metrics.get("last_action") or "",
+                "activity_level": _activity_level_from(last_activity, total_actions),
+            }
+        )
+
+    return report_rows
+
+
+def _build_new_registrations_report(days: int = 30):
+    start_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    users_res = execute_with_retry(
+        lambda: supabase.table("users")
+        .select("id, full_name, email, phone, role, status, created_at")
+        .gte("created_at", start_date)
+        .order("created_at", desc=True)
+    )
+    return users_res.data or []
+
+
+def _build_user_roles_distribution_report():
+    users_res = execute_with_retry(
+        lambda: supabase.table("users")
+        .select("role, status")
+    )
+    users = users_res.data or []
+    total_users = len(users)
+
+    role_counts = {}
+    for user in users:
+        role = user.get("role") or "unknown"
+        metrics = role_counts.setdefault(
+            role,
+            {"count": 0, "active": 0, "pending": 0, "suspended": 0},
+        )
+        metrics["count"] += 1
+
+        status = str(user.get("status") or "").lower()
+        if status == "active":
+            metrics["active"] += 1
+        elif status == "pending":
+            metrics["pending"] += 1
+        elif status == "suspended":
+            metrics["suspended"] += 1
+
+    report_rows = []
+    for role, metrics in sorted(role_counts.items()):
+        count = metrics["count"]
+        percentage = round((count / total_users) * 100, 2) if total_users else 0
+        report_rows.append(
+            {
+                "role": role,
+                "total_users": count,
+                "percentage": percentage,
+                "active_users": metrics["active"],
+                "pending_users": metrics["pending"],
+                "suspended_users": metrics["suspended"],
+            }
+        )
+
+    return report_rows
+
+
+# ADMIN AUTH MIDDLEWARE
 def require_admin(f):
     """Decorator to protect admin-only routes"""
     from functools import wraps
@@ -155,12 +305,11 @@ def require_admin(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         auth_header = request.headers.get("Authorization")
-        if not auth_header:
+        if not auth_header and not request.cookies.get("auth_token"):
             return jsonify({"error": "Missing authorization token"}), 401
 
         try:
-            token = auth_header.split(" ")[1]
-            payload = decode_jwt(token)
+            payload = decode_request_token(request)
 
             if not payload:
                 return jsonify({"error": "Invalid or expired token"}), 401
@@ -181,10 +330,8 @@ def require_admin(f):
     return decorated
 
 
-# ────────────────────────────────────────────────────────────────
-# 📊 GET ADMIN DASHBOARD STATS
+# GET ADMIN DASHBOARD STATS
 # GET /api/admin/stats
-# ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/stats", methods=["GET"])
 @require_admin
 def get_admin_stats():
@@ -251,10 +398,8 @@ def get_admin_stats():
         return jsonify({"error": str(e)}), 500
 
 
-# ────────────────────────────────────────────────────────────────
-# 🏢 GET PENDING NGO APPLICATIONS
+# GET PENDING NGO APPLICATIONS
 # GET /api/admin/ngos/pending
-# ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/ngos/pending", methods=["GET"])
 @require_admin
 def get_pending_ngos():
@@ -313,10 +458,8 @@ def get_pending_ngos():
         return jsonify({"error": str(e)}), 500
 
 
-# ────────────────────────────────────────────────────────────────
-# ✅ APPROVE NGO APPLICATION
+# APPROVE NGO APPLICATION
 # PUT /api/admin/ngos/<user_id>/approve
-# ──���─────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/ngos/<user_id>/approve", methods=["PUT"])
 @require_admin
 def approve_ngo(user_id):
@@ -326,7 +469,7 @@ def approve_ngo(user_id):
     try:
         now = datetime.utcnow().isoformat()
 
-        # 1. Fetch user
+        # . Fetch user
         user_res = (
             supabase.table("users")
             .select("id, email, full_name, status")
@@ -340,7 +483,7 @@ def approve_ngo(user_id):
 
         user = user_res.data
 
-        # 2. Update organization verification status
+        # . Update organization verification status
         org_update = (
             supabase.table("organizations")
             .update({
@@ -353,12 +496,12 @@ def approve_ngo(user_id):
         if not org_update.data:
             return jsonify({"error": "Organization not found"}), 404
 
-        # 3. Ensure user status is active
+        # . Ensure user status is active
         supabase.table("users").update({
             "status": "active",
         }).eq("id", user_id).execute()
 
-        # 4. Create notification
+        # . Create notification
         supabase.table("notifications").insert({
             "user_id": user_id,
             "title": "NGO Application Approved",
@@ -371,7 +514,7 @@ def approve_ngo(user_id):
             "created_at": now,
         }).execute()
 
-        # 5. Send approval email
+        # . Send approval email
         try:
             msg = Message(
                 subject="Your NGO Application Has Been Approved - FoodShare",
@@ -420,10 +563,8 @@ The FoodShare Team
         return jsonify({"error": str(e)}), 500
 
 
-# ────────────────────────────────────────────────────────────────
-# ❌ REJECT NGO APPLICATION
+# REJECT NGO APPLICATION
 # PUT /api/admin/ngos/<user_id>/reject
-# ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/ngos/<user_id>/reject", methods=["PUT"])
 @require_admin
 def reject_ngo(user_id):
@@ -436,7 +577,7 @@ def reject_ngo(user_id):
 
         now = datetime.utcnow().isoformat()
 
-        # 1. Fetch user
+        # . Fetch user
         user_res = (
             supabase.table("users")
             .select("id, email, full_name")
@@ -450,7 +591,7 @@ def reject_ngo(user_id):
 
         user = user_res.data
 
-        # 2. Update organization verification status
+        # . Update organization verification status
         org_update = (
             supabase.table("organizations")
             .update({
@@ -463,12 +604,12 @@ def reject_ngo(user_id):
         if not org_update.data:
             return jsonify({"error": "Organization not found"}), 404
 
-        # 3. Update user status
+        # . Update user status
         supabase.table("users").update({
             "status": "rejected",
         }).eq("id", user_id).execute()
 
-        # 4. Create notification
+        # . Create notification
         supabase.table("notifications").insert({
             "user_id": user_id,
             "title": "NGO Application Not Approved",
@@ -478,7 +619,7 @@ def reject_ngo(user_id):
             "created_at": now,
         }).execute()
 
-        # 5. Send rejection email
+        # . Send rejection email
         try:
             msg = Message(
                 subject="Update on Your NGO Application - FoodShare",
@@ -528,10 +669,8 @@ The FoodShare Team
         return jsonify({"error": str(e)}), 500
 
 
-# ────────────────────────────────────────────────────────────────
-# 👥 GET ALL USERS
+# GET ALL USERS
 # GET /api/admin/users
-# ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/users", methods=["GET"])
 @require_admin
 def get_all_users():
@@ -918,10 +1057,8 @@ def export_audit_logs():
         return jsonify({"error": str(e)}), 500
 
 
-# ────────────────────────────────────────────────────────────────
-# 🔄 UPDATE USER STATUS (Suspend/Activate)
+# UPDATE USER STATUS (Suspend/Activate)
 # PUT /api/admin/users/<user_id>/status
-# ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/users/<user_id>/status", methods=["PUT"])
 @require_admin
 def update_user_status(user_id):
@@ -937,7 +1074,7 @@ def update_user_status(user_id):
 
         now = datetime.utcnow().isoformat()
 
-        # 1. Fetch user
+        # . Fetch user
         user_res = (
             supabase.table("users")
             .select("id, email, full_name, role, status")
@@ -951,7 +1088,7 @@ def update_user_status(user_id):
 
         user = user_res.data
 
-        # 2. Prevent self-suspension (admin can't suspend themselves)
+        # . Prevent self-suspension (admin can't suspend themselves)
         auth_header = request.headers.get("Authorization")
         if auth_header:
             try:
@@ -962,12 +1099,12 @@ def update_user_status(user_id):
             except Exception:
                 pass
 
-        # 3. Update user status
+        # . Update user status
         supabase.table("users").update({
             "status": new_status,
         }).eq("id", user_id).execute()
 
-        # 4. Create notification
+        # . Create notification
         notification_title = "Account Suspended" if new_status == "suspended" else "Account Reactivated"
         notification_message = (
             "Your account has been suspended. Please contact support for more information."
@@ -984,7 +1121,7 @@ def update_user_status(user_id):
             "created_at": now,
         }).execute()
 
-        # 5. Send email notification
+        # . Send email notification
         try:
             subject = (
                 "Account Suspended - FoodShare"
@@ -1045,17 +1182,16 @@ The FoodShare Team
         return jsonify({"error": str(e)}), 500
 
 
-# ────────────────────────────────────────────────────────────────
-# 🗑️ DELETE USER ACCOUNT (Admin)
+# DELETE USER ACCOUNT (Admin)
 # DELETE /api/admin/users/<user_id>
-# ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/users/<user_id>", methods=["DELETE"])
+@require_admin
 def delete_user_admin(user_id):
     """
     Permanently delete a user account (admin action)
     """
     try:
-        # 1. Fetch user
+        # . Fetch user
         user_res = (
             supabase.table("users")
             .select("id, email, full_name, role")
@@ -1069,22 +1205,22 @@ def delete_user_admin(user_id):
 
         user = user_res.data
 
-        # 2. Prevent deleting admin accounts
+        # . Prevent deleting admin accounts
         if user.get("role") == "admin":
             return jsonify({"error": "Admin accounts cannot be deleted"}), 403
 
-        # 3. Anonymize donations (preserve history)
+        # . Anonymize donations (preserve history)
         supabase.table("food_donations").update({
             "donor_id": None,
         }).eq("donor_id", user_id).execute()
 
-        # 4. Delete related data
+        # . Delete related data
         supabase.table("notifications").delete().eq("user_id", user_id).execute()
         supabase.table("password_change_codes").delete().eq("user_id", user_id).execute()
         supabase.table("organizations").delete().eq("user_id", user_id).execute()
         supabase.table("ngo_claims").delete().eq("ngo_id", user_id).execute()
 
-        # 5. Delete user
+        # . Delete user
         supabase.table("users").delete().eq("id", user_id).execute()
 
         logger.info(f"Admin deleted user: {user_id}")
@@ -1109,11 +1245,10 @@ def delete_user_admin(user_id):
         return jsonify({"error": str(e)}), 500
 
 
-# ────────────────────────────────────────────────────────────────
-# 📈 GET ALL DONATIONS (Admin View)
+# GET ALL DONATIONS (Admin View)
 # GET /api/admin/donations
-# ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/donations", methods=["GET"])
+@require_admin
 def get_all_donations():
     """
     Fetch all donations with filters for admin moderation
@@ -1180,10 +1315,8 @@ def get_all_donations():
         return jsonify({"error": str(e)}), 500
 
 
-# ────────────────────────────────────────────────────────────────
-# 📊 GENERATE REPORTS
+# GENERATE REPORTS
 # GET /api/admin/reports/<report_type>
-# ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/reports/<report_type>", methods=["GET"])
 @require_admin
 def generate_report(report_type):
@@ -1208,6 +1341,34 @@ def generate_report(report_type):
                 "generated_at": datetime.utcnow().isoformat(),
                 "total_records": len(users_res.data or []),
                 "data": users_res.data or [],
+            }), 200
+
+        elif report_type == "user-activity":
+            report_rows = _build_user_activity_report()
+            return jsonify({
+                "report_type": "user-activity",
+                "generated_at": datetime.utcnow().isoformat(),
+                "total_records": len(report_rows),
+                "data": report_rows,
+            }), 200
+
+        elif report_type == "new-registrations":
+            report_rows = _build_new_registrations_report()
+            return jsonify({
+                "report_type": "new-registrations",
+                "generated_at": datetime.utcnow().isoformat(),
+                "total_records": len(report_rows),
+                "filters": {"window_days": 30},
+                "data": report_rows,
+            }), 200
+
+        elif report_type == "user-roles-distribution":
+            report_rows = _build_user_roles_distribution_report()
+            return jsonify({
+                "report_type": "user-roles-distribution",
+                "generated_at": datetime.utcnow().isoformat(),
+                "total_records": len(report_rows),
+                "data": report_rows,
             }), 200
 
         elif report_type == "donations":
@@ -1390,8 +1551,8 @@ def generate_report(report_type):
                     category_breakdown[cat] = category_breakdown.get(cat, 0) + kg
             
             # Environmental impact estimates
-            co2_avoided = total_food_kg * 2.5  # ~2.5kg CO2 per kg food waste
-            water_saved = total_food_kg * 1000  # ~1000L water per kg food
+            co2_avoided = total_food_kg * 2.5 # ~2.5kg CO2 per kg food waste
+            water_saved = total_food_kg * 1000 # ~1000L water per kg food
             
             return jsonify({
                 "report_type": "impact",
@@ -1416,10 +1577,8 @@ def generate_report(report_type):
         return jsonify({"error": str(e)}), 500
 
 
-# ────────────────────────────────────────────────────────────────
-# 📥 EXPORT REPORT AS CSV
+# EXPORT REPORT AS CSV
 # GET /api/admin/reports/<report_type>/export
-# ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/reports/<report_type>/export", methods=["GET"])
 @require_admin
 def export_report_csv(report_type):
@@ -1463,6 +1622,102 @@ def export_report_csv(report_type):
                 headers={"Content-Disposition": f"attachment; filename=users_report_{date.today()}.csv"}
             )
 
+        elif report_type == "user-activity":
+            data = _build_user_activity_report()
+            headers = [
+                "User ID",
+                "Full Name",
+                "Email",
+                "Role",
+                "Account Status",
+                "Last Login",
+                "Total Logins",
+                "Total Actions",
+                "Last Action",
+                "Activity Level",
+            ]
+
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(headers)
+
+            for row in data:
+                writer.writerow([
+                    row.get("id"),
+                    row.get("full_name"),
+                    row.get("email"),
+                    row.get("role"),
+                    row.get("account_status"),
+                    row.get("last_login"),
+                    row.get("total_logins"),
+                    row.get("total_actions"),
+                    row.get("last_action"),
+                    row.get("activity_level"),
+                ])
+
+            output.seek(0)
+
+            return Response(
+                output.getvalue(),
+                mimetype="text/csv",
+                headers={"Content-Disposition": f"attachment; filename=user_activity_report_{date.today()}.csv"}
+            )
+
+        elif report_type == "new-registrations":
+            data = _build_new_registrations_report()
+            headers = ["User ID", "Full Name", "Email", "Phone", "Role", "Status", "Created At"]
+
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(["Report Window", "Last 30 Days"])
+            writer.writerow([])
+            writer.writerow(headers)
+
+            for row in data:
+                writer.writerow([
+                    row.get("id"),
+                    row.get("full_name"),
+                    row.get("email"),
+                    row.get("phone"),
+                    row.get("role"),
+                    row.get("status"),
+                    row.get("created_at"),
+                ])
+
+            output.seek(0)
+
+            return Response(
+                output.getvalue(),
+                mimetype="text/csv",
+                headers={"Content-Disposition": f"attachment; filename=new_registrations_report_{date.today()}.csv"}
+            )
+
+        elif report_type == "user-roles-distribution":
+            data = _build_user_roles_distribution_report()
+            headers = ["Role", "Total Users", "Percentage", "Active Users", "Pending Users", "Suspended Users"]
+
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(headers)
+
+            for row in data:
+                writer.writerow([
+                    row.get("role"),
+                    row.get("total_users"),
+                    row.get("percentage"),
+                    row.get("active_users"),
+                    row.get("pending_users"),
+                    row.get("suspended_users"),
+                ])
+
+            output.seek(0)
+
+            return Response(
+                output.getvalue(),
+                mimetype="text/csv",
+                headers={"Content-Disposition": f"attachment; filename=user_roles_distribution_{date.today()}.csv"}
+            )
+
         elif report_type == "donations":
             donations_res = (
                 supabase.table("food_donations")
@@ -1479,6 +1734,8 @@ def export_report_csv(report_type):
             writer.writerow(headers)
             
             for row in data:
+                created_at = str(row.get("created_at") or "").split("T")[0]
+                expiry_date = str(row.get("expiry_date") or "").split("T")[0]
                 writer.writerow([
                     row.get("id"),
                     row.get("title"),
@@ -1487,8 +1744,8 @@ def export_report_csv(report_type):
                     row.get("unit"),
                     row.get("status"),
                     row.get("final_state"),
-                    row.get("created_at"),
-                    row.get("expiry_date"),
+                    created_at,
+                    expiry_date,
                 ])
             
             output.seek(0)
@@ -1655,11 +1912,10 @@ def export_report_csv(report_type):
         return jsonify({"error": str(e)}), 500
 
 
-# ────────────────────────────────────────────────────────────────
-# 🔔 SEND BROADCAST NOTIFICATION
+# SEND BROADCAST NOTIFICATION
 # POST /api/admin/notifications/broadcast
-# ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/notifications/broadcast", methods=["POST"])
+@require_admin
 def send_broadcast_notification():
     """
     Send a notification to all users or specific role
@@ -1668,7 +1924,7 @@ def send_broadcast_notification():
         data = request.get_json() or {}
         title = data.get("title")
         message = data.get("message")
-        target_role = data.get("role")  # Optional: "donor", "ngo", or None for all
+        target_role = data.get("role") # Optional: "donor", "ngo", or None for all
 
         if not title or not message:
             return jsonify({"error": "Title and message are required"}), 400
@@ -1728,11 +1984,10 @@ def send_broadcast_notification():
         return jsonify({"error": str(e)}), 500
 
 
-# ────────────────────────────────────────────────────────────────
-# 🔧 SYSTEM HEALTH CHECK
+# SYSTEM HEALTH CHECK
 # GET /api/admin/health
-# ────────────────────────────────────────────────────────────────
 @admin_bp.route("/admin/health", methods=["GET"])
+@require_admin
 def system_health():
     """
     Check system health and database connectivity

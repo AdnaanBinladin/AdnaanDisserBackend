@@ -5,7 +5,7 @@ from typing import Any
 from flask import Request
 
 from src.services.supabase_service import supabase
-from src.utils.jwt import decode_jwt
+from src.utils.jwt import decode_request_token
 
 
 def _extract_ip(req: Request | None) -> str | None:
@@ -18,13 +18,7 @@ def _extract_ip(req: Request | None) -> str | None:
 
 
 def actor_from_request(req: Request | None) -> tuple[str | None, str | None]:
-    if req is None:
-        return None, None
-    auth_header = req.headers.get("Authorization") or ""
-    if not auth_header.lower().startswith("bearer "):
-        return None, None
-    token = auth_header.split(" ", 1)[1].strip()
-    payload = decode_jwt(token)
+    payload = decode_request_token(req)
     if not payload:
         return None, None
     return payload.get("user_id"), payload.get("role")
